@@ -682,6 +682,188 @@ extern Vec_Ptr_t * Abc_NtkCollectCoNames( Abc_Ntk_t * pNtk );
 
 extern void Extra_BitMatrixTransposeP( Vec_Wrd_t * vSimsIn, int nWordsIn, Vec_Wrd_t * vSimsOut, int nWordsOut );
 
+// added by ymc
+#include <sys/time.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+int ymc_hello_wrapper();
+int ymc_try_metis_wrapper();
+int ymc_test_yaig_wrapper();
+Abc_Ntk_t *ymc_pif_wrapper(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster, char *dirName, char *optScript, char *mapType, char *libPath);
+#ifdef __cplusplus
+}
+#endif
+static void timer(int reset)
+{
+	static struct timeval t1;
+	struct timeval t2;
+	double timeUsed;
+
+	if (reset) {
+		printf("Timer reset\n");
+		gettimeofday(&t1, NULL);
+		return;
+	}
+	t2 = t1;
+	gettimeofday(&t1, NULL);
+	timeUsed = t1.tv_sec - t2.tv_sec + (t1.tv_usec - t2.tv_usec) / 1000000.0;
+	printf("\n\nTime used since last timer(): %f\n\n\n", timeUsed);
+}
+static int Abc_CommandResetTimer(Abc_Frame_t *pAbc, int argc, char **argv)
+{
+	timer(1);
+	return 0;
+}
+static int Abc_CommandPrintTime(Abc_Frame_t *pAbc, int argc, char **argv)
+{
+	timer(0);
+	return 0;
+}
+static int Abc_CommandPif(Abc_Frame_t *pAbc, int argc, char **argv)
+{
+	uint32_t nParts = 0;
+	uint32_t sCluster = 0;
+	uint32_t c;
+	char *dirName = NULL;
+	char *optScript = NULL;
+	char *mapType = NULL;
+	char *libPath = NULL;
+
+	Extra_UtilGetoptReset();
+	while ((c = Extra_UtilGetopt(argc, argv, "NsdSmLh")) != EOF) {
+		switch (c) {
+		case 'N':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-N\" should be followed by a positive integer.\n");
+				goto usage;
+			}
+			nParts = atoi(argv[globalUtilOptind]);
+			globalUtilOptind++;
+			if (nParts == 1 || nParts > 1024) {
+				Abc_Print(-1, "Invalid nParts.(0(adaptive) or 2 <= nParts <= 1024)\n");
+				goto usage;
+			}
+			if (nParts > 0)
+				Abc_Print(-2, "Partition an AIG into %d subgraphs.\n", nParts);
+			break;
+		case 's':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-s\" should be followed by a positive integer.\n");
+				goto usage;
+			}
+			sCluster = atoi(argv[globalUtilOptind]);
+			globalUtilOptind++;
+			Abc_Print(-2, "Upper bound size for merged cluster: %d.\n", sCluster);
+			break;
+		case 'd':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-d\" should be followed by a directory path.\n");
+				goto usage;
+			}
+			dirName = argv[globalUtilOptind];
+			globalUtilOptind++;
+			break;
+		case 'S':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-S\" should be followed by a script string.\n");
+				goto usage;
+			}
+			optScript = argv[globalUtilOptind];
+			globalUtilOptind++;
+			break;
+		case 'm':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-m\" should be followed by fpga or asic.\n");
+				goto usage;
+			}
+			mapType = argv[globalUtilOptind];
+			globalUtilOptind++;
+			if (strcmp(mapType, "fpga") != 0 && strcmp(mapType, "asic") != 0) {
+				Abc_Print(-1, "Map type must be \"fpga\" or \"asic\".\n");
+				goto usage;
+			}
+			break;
+		case 'L':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-L\" should be followed by a library file path.\n");
+				goto usage;
+			}
+			libPath = argv[globalUtilOptind];
+			globalUtilOptind++;
+			break;
+		case 'h':
+			goto usage;
+		default:
+			goto usage;
+		}
+	}
+
+	if (globalUtilOptind == 1) {
+		Abc_Print(-1, "There is no option.\n");
+		goto usage;
+		return 1;
+	}
+
+	{
+		struct timeval t1, t2;
+		double time;
+		gettimeofday(&t1, NULL);
+
+		Abc_Ntk_t *pNtk = Abc_FrameReadNtk(pAbc);
+		Abc_Ntk_t *pNtkRes;
+		if (!Abc_NtkIsStrash(pNtk)) {
+			pNtk = Abc_NtkStrash(pNtk, 0, 0, 0);
+			if (pNtk == NULL) {
+				Abc_Print(-1, "Strashing before FPGA mapping has failed.\n");
+				return 1;
+			}
+			pNtk = Abc_NtkBalance(pNtkRes = pNtk, 0, 0, 1);
+			Abc_NtkDelete(pNtkRes);
+			if (pNtk == NULL) {
+				Abc_Print(-1, "Balancing before FPGA mapping has failed.\n");
+				return 1;
+			}
+			if (!Abc_FrameReadFlag("silentmode"))
+				Abc_Print(1, "The network was strashed and balanced before FPGA mapping.\n");
+
+			gettimeofday(&t2, NULL);
+			time = t2.tv_sec - t1.tv_sec + (t2.tv_usec - t1.tv_usec) / 1000000.0;
+			printf("strash & balance spent time: %f\n\n", time);
+		}
+
+		if (mapType && strcmp(mapType, "asic") == 0 && libPath == NULL) {
+			Abc_Print(-1, "ASIC mapping (-m asic) requires a standard cell library.\n");
+			Abc_Print(-1, "Please specify with -L, e.g.: pif -m asic -L mcnc.genlib\n");
+			return 1;
+		}
+
+		pNtkRes = ymc_pif_wrapper(pNtk, nParts, sCluster, dirName, optScript, mapType, libPath);
+		if (pNtkRes == NULL) {
+			Abc_Print(-1, "pif has failed.\n");
+			return 1;
+		}
+
+		printf("\n------------------------------------------\n\n");
+		Abc_FrameReplaceCurrentNetwork(pAbc, pNtkRes);
+	}
+
+	return 0;
+
+usage:
+	Abc_Print(-2, "usage: pif [-N num] [-d dir] [-s size] [-S script] [-m type] [-h]\n");
+	Abc_Print(-2, "\t           partition-based parallel optimization and mapping\n");
+	Abc_Print(-2, "\t-N num   : the number of partitions [default = adaptive]\n");
+	Abc_Print(-2, "\t-d dir   : the output directory for intermediate files\n");
+	Abc_Print(-2, "\t-s size  : upper bound of merged cluster size [default = adaptive]\n");
+	Abc_Print(-2, "\t-S script: optimization + mapping script for sub-networks\n");
+	Abc_Print(-2, "\t           [default = \"strash; dc2; fraig; resyn2; if -K 6 -C 8\"]\n");
+	Abc_Print(-2, "\t-m type  : mapping type: fpga or asic [default = fpga]\n");
+	Abc_Print(-2, "\t-L file  : standard cell library (.genlib) for ASIC mapping\n");
+	Abc_Print(-2, "\t-h       : print the command usage\n");
+	return 1;
+}
+
 typedef struct Wlc_Ntk_t_    Wlc_Ntk_t;
 typedef struct Wlc_BstPar_t_ Wlc_BstPar_t;
 extern Gia_Man_t * Wlc_NtkBitBlast( Wlc_Ntk_t * p, Wlc_BstPar_t * pPars );
@@ -1002,6 +1184,7 @@ void Abc_Init( Abc_Frame_t * pAbc )
     Cmd_CommandAdd( pAbc, "Synthesis",    "resub_unate",   Abc_CommandResubUnate,       1 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "resub_core",    Abc_CommandResubCore,        1 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "resub_check",   Abc_CommandResubCheck,       0 );
+    Cmd_CommandAdd(pAbc, "ymc", "pif", Abc_CommandPif, 0);
 //    Cmd_CommandAdd( pAbc, "Synthesis",    "rr",            Abc_CommandRr,               1 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "cascade",       Abc_CommandCascade,          1 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "lutcasdec",     Abc_CommandLutCasDec,        1 );
