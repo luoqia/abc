@@ -205,6 +205,8 @@ pMan->timeEvalMuxAn += Abc_Clock() - clk;
 clk = Abc_Clock();
         p2 = Lpk_MuxSplit( pMan, p, pResMux->Variable, pResMux->Polarity );
 pMan->timeEvalMuxSp += Abc_Clock() - clk;
+        if ( p2 == NULL )
+            return 0;
         if ( p2->nVars > p->nLutK && !Lpk_Decompose_rec( pMan, p2 ) )
             return 0;
         if ( p->nVars > p->nLutK && !Lpk_Decompose_rec( pMan, p ) )
