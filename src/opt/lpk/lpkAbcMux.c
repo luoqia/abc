@@ -189,7 +189,8 @@ Extra_PrintBinary( stdout, &uSupp, 16 ); printf( "\n\n" );
     p->uSupp |= (1 << Var);
     // update the truth table of the old component
     iVarVac = Kit_WordFindFirstBit( ~p->uSupp );
-    assert( iVarVac < (int)p->nVars );
+    if ( iVarVac >= (int)p->nVars )
+        return NULL;
     p->uSupp |= (1 << iVarVac);
     Kit_TruthIthVar( pTruth, p->nVars, iVarVac );
     if ( Pol )
