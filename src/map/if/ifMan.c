@@ -9,7 +9,7 @@
   Synopsis    [Mapping manager.]
 
   Author      [Alan Mishchenko]
-  
+
   Affiliation [UC Berkeley]
 
   Date        [Ver. 1.0. Started - November 21, 2006.]
@@ -39,10 +39,10 @@ static If_Set_t * If_ManCutSetFetch( If_Man_t * p )                    { If_Set_
 
 /**Function*************************************************************
 
-  Synopsis    [Starts the AIG manager.]
+  Synopsis    [Starts the AIG manager.根据参数 pPars 创建并初始化一个完整的 mapping manager If_Man_t]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -54,24 +54,24 @@ If_Man_t * If_ManStart( If_Par_t * pPars )
     assert( !pPars->fUseDsd || !pPars->fUseTtPerm );
     // start the manager
     p = ABC_ALLOC( If_Man_t, 1 );
-    memset( p, 0, sizeof(If_Man_t) );
+    memset( p, 0, sizeof(If_Man_t) ); //把 manager 的所有字段初始化为 0；如果后续没有特别设置的话，这些字段的默认值就是 0 或 NULL。
     p->pPars    = pPars;
     p->fEpsilon = pPars->Epsilon;
-    // allocate arrays for nodes
+    // allocate arrays for nodes，
     p->vCis     = Vec_PtrAlloc( 100 );
     p->vCos     = Vec_PtrAlloc( 100 );
     p->vObjs    = Vec_PtrAlloc( 100 );
     p->vTemp    = Vec_PtrAlloc( 100 );
     p->vVisited = Vec_PtrAlloc( 100 );
     // prepare the memory manager
-    if ( p->pPars->fTruth )
+    if ( p->pPars->fTruth )//真值表开关，默认关闭；如果开启，预分配每种叶子数对应的真值表存储结构，并预计算每种叶子数对应的真值表所需 64-bit word 数量。
     {
         for ( v = 0; v <= p->pPars->nLutSize; v++ )
-            p->nTruth6Words[v] = Abc_Truth6WordNum( v );
-        for ( v = 6; v <= Abc_MaxInt(6,p->pPars->nLutSize); v++ )
+            p->nTruth6Words[v] = Abc_Truth6WordNum( v ); //预计算每种叶子数对应的真值表所需 64-bit word 数量，int。
+        for ( v = 6; v <= Abc_MaxInt(6,p->pPars->nLutSize); v++ ) //对于 v≥6 的每种叶子数，分配独立的 Vec_Mem_t（带哈希的真值表去重存储）
             p->vTtMem[v] = Vec_MemAllocForTT( v, pPars->fUseTtPerm );
         for ( v = 0; v < 6; v++ )
-            p->vTtMem[v] = p->vTtMem[6];
+            p->vTtMem[v] = p->vTtMem[6]; //v<6 时共享 vTtMem[6]
         if ( p->pPars->fDelayOpt || pPars->nGateSize > 0 )
         {
             for ( v = 6; v <= Abc_MaxInt(6,p->pPars->nLutSize); v++ )
@@ -87,21 +87,23 @@ If_Man_t * If_ManStart( If_Par_t * pPars )
             p->vArray = Vec_IntAlloc( 1000 );
         }
     }
-    p->nPermWords  = p->pPars->fUsePerm? If_CutPermWords( p->pPars->nLutSize ) : 0;
+    p->nPermWords  = p->pPars->fUsePerm? If_CutPermWords( p->pPars->nLutSize ) : 0; //如果启用 perm，计算每个 cut 的 perm 需要多少个 int 来存储；如果不启用 perm，则为 0。
     p->nObjBytes   = sizeof(If_Obj_t) + sizeof(int) * (p->pPars->nLutSize + p->nPermWords);
     p->nCutBytes   = sizeof(If_Cut_t) + sizeof(int) * (p->pPars->nLutSize + p->nPermWords);
     p->nSetBytes   = sizeof(If_Set_t) + (sizeof(If_Cut_t *) + p->nCutBytes) * (p->pPars->nCutsMax + 1);
-    p->pMemObj     = Mem_FixedStart( p->nObjBytes );
+    p->pMemObj     = Mem_FixedStart( p->nObjBytes ); //对象内存池，每个对象占 nObjBytes 字节，初始分配 1000 个对象的空间；如果后续需要更多对象，内存池会自动扩展。
     // report expected memory usage
     if ( p->pPars->fVerbose )
-        Abc_Print( 1, "K = %d. Memory (bytes): Truth = %4d. Cut = %4d. Obj = %4d. Set = %4d. CutMin = %s\n", 
+        Abc_Print( 1, "K = %d. Memory (bytes): Truth = %4d. Cut = %4d. Obj = %4d. Set = %4d. CutMin = %s\n",
             p->pPars->nLutSize, 8 * p->nTruth6Words[p->pPars->nLutSize], p->nCutBytes, p->nObjBytes, p->nSetBytes, p->pPars->fCutMin? "yes":"no" );
     // room for temporary truth tables
+    //默认情况下 fTruth 是 0，表示不启用真值表；如果启用，预分配一大块连续内存给 puTemp[0]，大小足以容纳 4 个 nTruth6Words[nLutSize] 的 unsigned；puTemp[1]、puTemp[2]、puTemp[3] 分别指向这块内存的后续部分，分别作为计算过程中临时真值表的存储空间。
     p->puTemp[0] = p->pPars->fTruth? ABC_ALLOC( unsigned, 8 * p->nTruth6Words[p->pPars->nLutSize] ) : NULL;
     p->puTemp[1] = p->pPars->fTruth? p->puTemp[0] + p->nTruth6Words[p->pPars->nLutSize]*2 : NULL;
     p->puTemp[2] = p->pPars->fTruth? p->puTemp[1] + p->nTruth6Words[p->pPars->nLutSize]*2 : NULL;
     p->puTemp[3] = p->pPars->fTruth? p->puTemp[2] + p->nTruth6Words[p->pPars->nLutSize]*2 : NULL;
     p->puTempW   = p->pPars->fTruth? ABC_ALLOC( word, p->nTruth6Words[p->pPars->nLutSize] ) : NULL;
+    //默认情况下 fUseDsd、fUseTtPerm、fUseCofVars、fUseAndVars 都是 0，表示不启用；如果启用，预分配相关的数据结构。
     if ( pPars->fUseDsd )
     {
         for ( v = 6; v <= Abc_MaxInt(6,p->pPars->nLutSize); v++ )
@@ -166,9 +168,9 @@ If_Man_t * If_ManStart( If_Par_t * pPars )
     }
     // create the constant node
     p->pConst1   = If_ManSetupObj( p );
-    p->pConst1->Type   = IF_CONST1;
-    p->pConst1->fPhase = 1;
-    p->nObjs[IF_CONST1]++;
+    p->pConst1->Type   = IF_CONST1; //常量节点，类型为 IF_CONST1
+    p->pConst1->fPhase = 1;  //常量节点的 fPhase 字段设置为 1，表示逻辑值为 1；如果是常量 0，则 fPhase 应该设置为 0。
+    p->nObjs[IF_CONST1]++;  //常量节点计数加 1
     return p;
 }
 
@@ -177,7 +179,7 @@ If_Man_t * If_ManStart( If_Par_t * pPars )
   Synopsis    []
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -185,6 +187,7 @@ If_Man_t * If_ManStart( If_Par_t * pPars )
 ***********************************************************************/
 void If_ManRestart( If_Man_t * p )
 {
+    If_ManParFree( p );
     ABC_FREE( p->pMemCi );
     Vec_PtrClear( p->vCis );
     Vec_PtrClear( p->vCos );
@@ -194,7 +197,7 @@ void If_ManRestart( If_Man_t * p )
     // create the constant node
     p->pConst1 = If_ManSetupObj( p );
     p->pConst1->Type = IF_CONST1;
-    p->pConst1->fPhase = 1;
+    p->pConst1->fPhase = 1;  //常量节点的 fPhase 字段设置为 1，表示逻辑值为 1；如果是常量 0，则 fPhase 应该设置为 0。
     // reset the counter of other nodes
     p->nObjs[IF_CI] = p->nObjs[IF_CO] = p->nObjs[IF_AND] = 0;
 }
@@ -204,7 +207,7 @@ void If_ManRestart( If_Man_t * p )
   Synopsis    []
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -218,8 +221,8 @@ void If_ManSimpleSort( int * pArray, int nSize )
         for ( j = i+1; j < nSize; j++ )
             if ( pArray[j] < pArray[best_i] )
                 best_i = j;
-        temp = pArray[i]; 
-        pArray[i] = pArray[best_i]; 
+        temp = pArray[i];
+        pArray[i] = pArray[best_i];
         pArray[best_i] = temp;
     }
 }
@@ -268,21 +271,21 @@ int If_ManDumpData2( If_Man_t * p, FILE * pFile )
     Vec_Int_t * vCuts = Vec_IntAlloc( 1 << 20 );
     Vec_Int_t * vFanins = Vec_IntAlloc( If_ManCoNum(p) );
     Vec_Int_t * vCutCosts = Vec_IntAlloc( 1 << 16 );
-    Vec_Int_t * vLevel; If_Obj_t * pObj; 
+    Vec_Int_t * vLevel; If_Obj_t * pObj;
     int i, k, Obj, nObjs = 0, nBytes = 0;
     Vec_Wec_t * vLevels = Vec_WecStart( p->nLevelMax );
-    If_ManForEachNode( p, pObj, i ) 
+    If_ManForEachNode( p, pObj, i )
         Vec_WecPush( vLevels, pObj->Level, i );
     Vec_IntWriteEntry( vCopy, 0, nObjs++ );
     If_ManForEachCi( p, pObj, i )
         Vec_IntWriteEntry( vCopy, pObj->Id, nObjs++ );
-    Vec_WecForEachLevelStart( vLevels, vLevel, i, 1 ) 
+    Vec_WecForEachLevelStart( vLevels, vLevel, i, 1 )
         Vec_IntForEachEntry( vLevel, Obj, k ) {
             Vec_IntWriteEntry( vCopy, Obj, nObjs++ );
             Vec_IntPush( vCopy2, Obj - 1 - If_ManCiNum(p) );
         }
     assert( Vec_IntSize(vCopy2) == If_ManAndNum(p) );
-    assert( nObjs == 1 + If_ManCiNum(p) + If_ManAndNum(p) );      
+    assert( nObjs == 1 + If_ManCiNum(p) + If_ManAndNum(p) );
     nObjs = If_ManCiNum(p) + 1;
     Vec_WecForEachLevelStart( vLevels, vLevel, i, 1 ) {
         Vec_IntPush( vLevelLims, nObjs );
@@ -314,8 +317,8 @@ int If_ManDumpData2( If_Man_t * p, FILE * pFile )
     Vec_IntFree( vCopy2 );
     Vec_IntFree( vLevelLims );
     Vec_IntFree( vCuts );
-    Vec_IntFree( vFanins );    
-    Vec_IntFree( vCutCosts );    
+    Vec_IntFree( vFanins );
+    Vec_IntFree( vCutCosts );
     return nBytes;
 }
 int If_ManDumpData( If_Man_t * p, FILE * pFile )
@@ -327,7 +330,7 @@ int If_ManDumpData( If_Man_t * p, FILE * pFile )
     Vec_IntAppend( vCuts, p->vCuts );
     If_ManForEachCo( p, pObj, i )  {
         Vec_IntPush( vCuts, If_ObjFanin0(pObj)->Id );
-        Vec_IntFillExtra( vCuts, Vec_IntSize(vCuts)+nSpace-1, -1 ); 
+        Vec_IntFillExtra( vCuts, Vec_IntSize(vCuts)+nSpace-1, -1 );
     }
     nBytes = fwrite( Vec_IntArray(vCuts), 1, sizeof(int)*Vec_IntSize(vCuts), pFile );
     assert( nBytes == If_ManObjNum(p)*nSpace*sizeof(int) );
@@ -340,7 +343,7 @@ int If_ManDumpData( If_Man_t * p, FILE * pFile )
   Synopsis    []
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -348,7 +351,7 @@ int If_ManDumpData( If_Man_t * p, FILE * pFile )
 ***********************************************************************/
 void If_ManStop( If_Man_t * p )
 {
-    if ( p->pPars->fDumpFile && p->pPars->nLutSize <= 6 ) 
+    if ( p->pPars->fDumpFile && p->pPars->nLutSize <= 6 )
     {
         char pFileName[1000] = {0};
         // "I15_O20_L32_N256_C16_K6__name.bin"
@@ -367,17 +370,17 @@ void If_ManStop( If_Man_t * p )
             printf( "Finished writing cut information into file \"%s\" (%.3f MB).\n", pFileName, 1.0 * nBytes / (1<<20) );
         }
     }
-    else if ( p->pPars->fDumpFile && p->pPars->fTruth ) 
+    else if ( p->pPars->fDumpFile && p->pPars->fTruth )
     {
         char pFileName[1000] = {0}, pBuffer[100];
         int nUnique = 0, nChunks = 0, nChunkSize = 1 << 10, nBytes = 0;
         char * pName = Extra_FileNameGeneric(Extra_FileNameWithoutPath(p->pName));
         sprintf( pFileName, "%s__", pName );
-        ABC_FREE( pName );        
+        ABC_FREE( pName );
         for ( int i = 7; i <= p->pPars->nLutSize; i++ ) {
             nUnique = Vec_MemEntryNum(p->vTtMem[i]);
             nChunks = (nUnique + nChunkSize - 1) / nChunkSize;
-            printf( "LutSize = %2d  Unique = %7d  Chunks = %7d\n", i, nUnique, nChunks );            
+            printf( "LutSize = %2d  Unique = %7d  Chunks = %7d\n", i, nUnique, nChunks );
             sprintf( pBuffer, "%s%02d_%02d", i == 7 ? "":"__", i, nChunks );
             strcat( pFileName, pBuffer );
         }
@@ -398,7 +401,7 @@ void If_ManStop( If_Man_t * p )
                     Count += fwrite( (unsigned *)pZeros, 1, sizeof(word) * nEntrySize, pFile );
                 ABC_FREE( pZeros );
                 assert( Count == nChunks * nChunkSize * nEntrySize * sizeof(word) );
-                nBytes += nChunks * nChunkSize * nEntrySize * sizeof(word);                
+                nBytes += nChunks * nChunkSize * nEntrySize * sizeof(word);
             }
             fclose( pFile );
             printf( "Finished writing truth tables into file \"%s\" (%.3f MB).\n", pFileName, 1.0 * nBytes / (1<<20) );
@@ -416,11 +419,11 @@ void If_ManStop( If_Man_t * p )
             nUnique += Vec_MemEntryNum(p->vTtMem[i]);
         for ( i = 6; i <= Abc_MaxInt(6,p->pPars->nLutSize); i++ )
             nMemTotal += (int)Vec_MemMemory(p->vTtMem[i]);
-        printf( "Unique truth tables = %d   Memory = %.2f MB   ", nUnique, 1.0 * nMemTotal / (1<<20) ); 
+        printf( "Unique truth tables = %d   Memory = %.2f MB   ", nUnique, 1.0 * nMemTotal / (1<<20) );
         Abc_PrintTime( 1, "Time", p->timeCache[4] );
         if ( p->nCacheMisses )
         {
-            printf( "Cache hits = %d. Cache misses = %d  (%.2f %%)\n", p->nCacheHits, p->nCacheMisses, 100.0 * p->nCacheMisses / (p->nCacheHits + p->nCacheMisses) ); 
+            printf( "Cache hits = %d. Cache misses = %d  (%.2f %%)\n", p->nCacheHits, p->nCacheMisses, 100.0 * p->nCacheMisses / (p->nCacheHits + p->nCacheMisses) );
             Abc_PrintTime( 1, "Non-DSD   ", p->timeCache[0] );
             Abc_PrintTime( 1, "DSD hits  ", p->timeCache[1] );
             Abc_PrintTime( 1, "DSD misses", p->timeCache[2] );
@@ -442,6 +445,7 @@ void If_ManStop( If_Man_t * p )
     if ( p->pPars->fUseDsd && (p->nCountNonDec[0] || p->nCountNonDec[1]) )
         printf( "NonDec0 = %d.  NonDec1 = %d.\n", p->nCountNonDec[0], p->nCountNonDec[1] );
     Vec_IntFreeP( &p->vCoAttrs );
+    If_ManParFree( p );
     Vec_PtrFree( p->vCis );
     Vec_PtrFree( p->vCos );
     Vec_PtrFree( p->vObjs );
@@ -521,12 +525,13 @@ void If_ManStop( If_Man_t * p )
   Synopsis    [Creates primary input.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
+// 在 IF manager 中创建一个新的 CI 对象（分配内存、设 Type=IF_CI、加入 vCis 和 vObjs）
 If_Obj_t * If_ManCreateCi( If_Man_t * p )
 {
     If_Obj_t * pObj;
@@ -543,12 +548,13 @@ If_Obj_t * If_ManCreateCi( If_Man_t * p )
   Synopsis    [Creates primary output with the given driver.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
+//在 IF manager 中创建一个新的 CO 对象，设置好 fanin0、Level（取 fanin 的 Level）、并将其加入 vCos 和 vObjs
 If_Obj_t * If_ManCreateCo( If_Man_t * p, If_Obj_t * pDriver )
 {
     If_Obj_t * pObj;
@@ -557,7 +563,7 @@ If_Obj_t * If_ManCreateCo( If_Man_t * p, If_Obj_t * pDriver )
     Vec_PtrPush( p->vCos, pObj );
     pObj->Type = IF_CO;
     pObj->fCompl0 = If_IsComplement(pDriver); pDriver = If_Regular(pDriver);
-    pObj->pFanin0 = pDriver; pDriver->nRefs++; 
+    pObj->pFanin0 = pDriver; pDriver->nRefs++;
     pObj->fPhase  = (pObj->fCompl0 ^ pDriver->fPhase);
     pObj->Level   = pDriver->Level;
     if ( p->nLevelMax < (int)pObj->Level )
@@ -571,12 +577,13 @@ If_Obj_t * If_ManCreateCo( If_Man_t * p, If_Obj_t * pDriver )
   Synopsis    [Create the new node assuming it does not exist.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
+//在 IF manager 中创建一个新的 AND 节点，设置好 fanin0/fanin1、Level（取 fanin 的 max + 1）、并将其加入 vObjs
 If_Obj_t * If_ManCreateAnd( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t * pFan1 )
 {
     If_Obj_t * pObj;
@@ -594,8 +601,8 @@ If_Obj_t * If_ManCreateAnd( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t * pFan1 )
     pObj->Type    = IF_AND;
     pObj->fCompl0 = If_IsComplement(pFan0); pFan0 = If_Regular(pFan0);
     pObj->fCompl1 = If_IsComplement(pFan1); pFan1 = If_Regular(pFan1);
-    pObj->pFanin0 = pFan0; pFan0->nRefs++; pFan0->nVisits++; pFan0->nVisitsCopy++;
-    pObj->pFanin1 = pFan1; pFan1->nRefs++; pFan1->nVisits++; pFan1->nVisitsCopy++;
+    pObj->pFanin0 = pFan0; pFan0->nRefs++; pFan0->nVisits++; pFan0->nVisitsCopy++; //nVisits 在建图时就作为“未来还会被多少次用到”的计数准备好了
+    pObj->pFanin1 = pFan1; pFan1->nRefs++; pFan1->nVisits++; pFan1->nVisitsCopy++; //nVisits 在建图时就作为“未来还会被多少次用到”的计数准备好了
     pObj->fPhase  = (pObj->fCompl0 ^ pFan0->fPhase) & (pObj->fCompl1 ^ pFan1->fPhase);
     pObj->Level   = 1 + IF_MAX( pFan0->Level, pFan1->Level );
     if ( p->nLevelMax < (int)pObj->Level )
@@ -609,7 +616,7 @@ If_Obj_t * If_ManCreateAnd( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t * pFan1 )
   Synopsis    [Create the new node assuming it does not exist.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -628,7 +635,7 @@ If_Obj_t * If_ManCreateXor( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t * pFan1 )
   Synopsis    [Create the new node assuming it does not exist.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -647,12 +654,14 @@ If_Obj_t * If_ManCreateMux( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t * pFan1, If
   Synopsis    [Creates the choice node.]
 
   Description [Should be called after the equivalence class nodes are linked.]
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
+//把代表节点标记为 fRepr = 1。
+//对链上每个等价节点设置 nRefs = 0（因为在映射期间，只有代表节点会被外部引用；等价节点的引用通过代表节点间接体现）。
 void If_ManCreateChoice( If_Man_t * p, If_Obj_t * pObj )
 {
     If_Obj_t * pTemp;
@@ -663,7 +672,7 @@ void If_ManCreateChoice( If_Man_t * p, If_Obj_t * pObj )
     for ( pTemp = pObj; pTemp; pTemp = pTemp->pEquiv )
     {
         pObj->Level = IF_MAX( pObj->Level, pTemp->Level );
-        pTemp->nVisits++; pTemp->nVisitsCopy++;
+        pTemp->nVisits++; pTemp->nVisitsCopy++; //nVisits 在建图时就作为“未来还会被多少次用到”的计数准备好了
     }
     // mark the largest level
     if ( p->nLevelMax < (int)pObj->Level )
@@ -676,7 +685,7 @@ void If_ManCreateChoice( If_Man_t * p, If_Obj_t * pObj )
   Synopsis    [Prepares memory for one cutset.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -692,7 +701,7 @@ void If_ManSetupSet( If_Man_t * p, If_Set_t * pSet )
     pArray = (char *)pSet->ppCuts + sizeof(If_Cut_t *) * (pSet->nCutsMax+1);
     for ( i = 0; i <= pSet->nCutsMax; i++ )
     {
-        pSet->ppCuts[i] = (If_Cut_t *)(pArray + i * p->nCutBytes); 
+        pSet->ppCuts[i] = (If_Cut_t *)(pArray + i * p->nCutBytes);
         If_CutSetup( p, pSet->ppCuts[i] );
     }
 //    pArray += (pSet->nCutsMax + 1) * p->nCutBytes;
@@ -704,7 +713,7 @@ void If_ManSetupSet( If_Man_t * p, If_Set_t * pSet )
   Synopsis    [Prepares memory for one cut.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -728,20 +737,20 @@ void If_ManSetupCutTriv( If_Man_t * p, If_Cut_t * pCut, int ObjId )
   Synopsis    [Prepares memory for the node with cuts.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
-If_Obj_t * If_ManSetupObj( If_Man_t * p )
+If_Obj_t * If_ManSetupObj( If_Man_t * p ) //从内存池分配一个 If_Obj_t，memset 清零，分配递增 ID，加入 vObjs，设 Required = IF_FLOAT_LARGE
 {
     If_Obj_t * pObj;
     // get memory for the object
     pObj = (If_Obj_t *)Mem_FixedEntryFetch( p->pMemObj );
     memset( pObj, 0, sizeof(If_Obj_t) );
     If_CutSetup( p, &pObj->CutBest );
-    // assign ID and save 
+    // assign ID and save
     pObj->Id = Vec_PtrSize(p->vObjs);
     Vec_PtrPush( p->vObjs, pObj );
     // set the required times
@@ -754,12 +763,13 @@ If_Obj_t * If_ManSetupObj( If_Man_t * p )
   Synopsis    [Prepares memory for one cut.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
+//为所有 CI 节点初始化 trivial cut（单叶子 cut，即"自身"）和 cutset 数据结构。
 void If_ManSetupCiCutSets( If_Man_t * p )
 {
     If_Obj_t * pObj;
@@ -785,12 +795,13 @@ void If_ManSetupCiCutSets( If_Man_t * p )
   Synopsis    [Prepares cutset of the node.]
 
   Description [Elementary cutset will be added last.]
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
+//为 AND 节点分配一个 cutset 数据结构，从cutset内存池中获取一个 cutset，设置 nCuts = 0 和 nCutsMax = p->pPars->nCutsMax，并将其指针保存在节点的 pCutSet 字段中。
 If_Set_t * If_ManSetupNodeCutSet( If_Man_t * p, If_Obj_t * pObj )
 {
     assert( If_ObjIsAnd(pObj) );
@@ -808,7 +819,7 @@ If_Set_t * If_ManSetupNodeCutSet( If_Man_t * p, If_Obj_t * pObj )
   Synopsis    [Dereferences cutset of the node.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -851,7 +862,7 @@ void If_ManDerefNodeCutSet( If_Man_t * p, If_Obj_t * pObj )
   Synopsis    [Dereferences cutset of the node.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -881,7 +892,7 @@ void If_ManDerefChoiceCutSet( If_Man_t * p, If_Obj_t * pObj )
   Synopsis    [Dereferences cutset of the node.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -906,9 +917,9 @@ void If_ManSetupSetAll( If_Man_t * p, int nCrossCut )
 
     if ( p->pPars->fVerbose )
     {
-        Abc_Print( 1, "Node = %7d.  Ch = %5d.  Total mem = %7.2f MB. Peak cut mem = %7.2f MB.\n", 
+        Abc_Print( 1, "Node = %7d.  Ch = %5d.  Total mem = %7.2f MB. Peak cut mem = %7.2f MB.\n",
             If_ManAndNum(p), p->nChoices,
-            1.0 * (p->nObjBytes + 2*sizeof(void *)) * If_ManObjNum(p) / (1<<20), 
+            1.0 * (p->nObjBytes + 2*sizeof(void *)) * If_ManObjNum(p) / (1<<20),
             1.0 * p->nSetBytes * nCrossCut / (1<<20) );
     }
 //    Abc_Print( 1, "Cross cut = %d.\n", nCrossCut );
@@ -921,4 +932,3 @@ void If_ManSetupSetAll( If_Man_t * p, int nCrossCut )
 
 
 ABC_NAMESPACE_IMPL_END
-

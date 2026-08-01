@@ -167,9 +167,10 @@ void If_ObjPerformMappingAnd( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPrep
     If_Cut_t * pCut0R, * pCut1R;
     int fFunc0R, fFunc1R;
     int i, k, v, iCutDsd, fChange;
+    //fsave0默认为0
     int fSave0 = p->pPars->fDelayOpt || p->pPars->fDelayOptLut || p->pPars->fDsdBalance || p->pPars->fUserRecLib || p->pPars->fUserSesLib || p->pPars->fUserLutDec || p->pPars->fUserLut2D ||
         p->pPars->fUseDsdTune || p->pPars->fUseCofVars || p->pPars->fUseAndVars || p->pPars->fUse34Spec || p->pPars->pLutStruct || p->pPars->pFuncCell2 || p->pPars->fUseCheck1 || p->pPars->fUseCheck2 || p->pPars->fEnableCheck07;
-    int fUseAndCut = (p->pPars->nAndDelay > 0) || (p->pPars->nAndArea > 0);
+    int fUseAndCut = (p->pPars->nAndDelay > 0) || (p->pPars->nAndArea > 0); //默认为0
     assert( !If_ObjIsAnd(pObj->pFanin0) || pObj->pFanin0->pCutSet->nCuts > 0 );
     assert( !If_ObjIsAnd(pObj->pFanin1) || pObj->pFanin1->pCutSet->nCuts > 0 );
 
@@ -180,10 +181,10 @@ void If_ObjPerformMappingAnd( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPrep
         pObj->EstRefs = (float)((2.0 * pObj->EstRefs + pObj->nRefs) / 3.0);
     // deref the selected cut
     if ( Mode && pObj->nRefs > 0 )
-        If_CutAreaDeref( p, If_ObjCutBest(pObj) );
+        If_CutAreaDeref( p, If_ObjCutBest(pObj) ); //解引用cutbest，对叶子节点递归地减小引用数nref，并计算面积；如果叶子节点的引用数递减后仍大于0或者不是and门，则不继续递归
 
     // prepare the cutset
-    pCutSet = If_ManSetupNodeCutSet( p, pObj );
+    pCutSet = If_ManSetupNodeCutSet( p, pObj ); //从 cutset 空闲链表（freelist）中取出一个预分配好的 If_Set_t 给当前 AND 节点使用，设置 nCuts = 0 和 nCutsMax = p->pPars->nCutsMax，并将其指针保存在节点的 pCutSet 字段中。
 
     // get the current assigned best cut
     pCut = If_ObjCutBest(pObj);
@@ -249,9 +250,9 @@ IfMapBestCutDone:
             Abc_Print( 1, "If_ObjPerformMappingAnd(): Warning! Node with ID %d has delay (%f) exceeding the required times (%f).\n", 
                 pObj->Id, pCut->Delay, pObj->Required + p->fEpsilon );
         pCut->Area = (Mode == 2)? If_CutAreaDerefed( p, pCut ) : If_CutAreaFlow( p, pCut );
-        if ( p->pPars->fEdge )
+        if ( p->pPars->fEdge ) //默认为1
             pCut->Edge = (Mode == 2)? If_CutEdgeDerefed( p, pCut ) : If_CutEdgeFlow( p, pCut );
-        if ( p->pPars->fPower )
+        if ( p->pPars->fPower ) //默认为0
             pCut->Power = (Mode == 2)? If_CutPowerDerefed( p, pCut, pObj ) : If_CutPowerFlow( p, pCut, pObj );
         // save the best cut from the previous iteration
         if ( !fPreprocess || pCut->nLeaves <= 1 )
@@ -259,20 +260,28 @@ IfMapBestCutDone:
     }
 
     // generate cuts
+    //双层循环遍历 fanin0 的每个 cut 与 fanin1 的每个 cut。
     If_ObjForEachCut( pObj->pFanin0, pCut0, i )
     If_ObjForEachCut( pObj->pFanin1, pCut1, k )
     {
         // get the next free cut
         assert( pCutSet->nCuts <= pCutSet->nCutsMax );
-        pCut = pCutSet->ppCuts[pCutSet->nCuts];
-        // make sure K-feasible cut exists
+        pCut = pCutSet->ppCuts[pCutSet->nCuts]; //取指针
+        // make sure K-feasible cut exists，先做 K-feasible 快速筛（签名 1 位计数超过 LUT size 直接跳过）
         if ( If_WordCountOnes(pCut0->uSign | pCut1->uSign) > p->pPars->nLutSize )
-            continue;
+            continue;//这是按位或，得到两个 cut 叶子签名的并集签名
 
         pCut0R = pCut0;
         pCut1R = pCut1;
-        fFunc0R = pCut0->iCutFunc ^ pCut0->fCompl ^ pObj->fCompl0;
+        /*
+        ftruth默认不开启，fFunc0R 和 fFunc1R 没有实际意义，主要用于当 fUseTtPerm 开启时，比较两个 cut 的函数 ID 来决定哪个 cut 放在 pCut0R（如果 fUseTtPerm 关闭了，就直接把原来的 pCut0 和 pCut1 赋值给 pCut0R 和 pCut1R，不进行比较和交换了）。
+        把三层极性叠加成“该 fanin 在当前节点语境下的真实函数 literal”：
+        cut 自身函数的补位（iCutFunc 里）
+        cut 标志补位（fCompl）
+        当前节点输入边补位（fCompl0/1）*/
+        fFunc0R = pCut0->iCutFunc ^ pCut0->fCompl ^ pObj->fCompl0;  //按位异或
         fFunc1R = pCut1->iCutFunc ^ pCut1->fCompl ^ pObj->fCompl1;
+        //当 fUseTtPerm 开启时，把"叶子多的 cut"放到 pCut0R
         if ( !p->pPars->fUseTtPerm || pCut0->nLeaves > pCut1->nLeaves || (pCut0->nLeaves == pCut1->nLeaves && fFunc0R > fFunc1R) )
         {
         }
@@ -293,21 +302,29 @@ IfMapBestCutDone:
             if ( !If_CutMergeOrdered( p, pCut0, pCut1, pCut ) )
                 continue;
         }
+            //若开启lut分解过滤，且当前 cut 叶子数超过分解阈值，跳过该 cut。默认不开启
         if ( p->pPars->fUserLutDec && !fFirst && (int)pCut->nLeaves > p->pPars->nLutDecSize )
             continue;
+            //若节点被标记为fspec，且当前 cut 叶子数用满K个输入，跳过该 cut，这是某些特殊映射模式的约束。默认不开启
         if ( pObj->fSpec && pCut->nLeaves == (unsigned)p->pPars->nLutSize )
             continue;
+        //计数器递增，nCutsMerged 是当前轮的合并计数（每轮开始清零），nCutsTotal 是全局累积计数。这两个值在 verbose 输出里会打印
         p->nCutsMerged++;
         p->nCutsTotal++;
         // check if this cut is contained in any of the available cuts
+        //支配性过滤
         if ( !p->pPars->fSkipCutFilter && If_CutFilter( pCutSet, pCut, fSave0 ) )
             continue;
         // check if the cut is a special AND-gate cut
+        /*
+        如果启用了 AND 门映射（nAndDelay > 0 或 nAndArea > 0），且这个 cut 恰好是 2 个叶子、就是节点自身的两个 fanin，
+        那就标记为 AND-gate cut。后续计算 area/delay 时，fAndCut 为 1 的 cut 会用 AND 门的面积/延迟参数（nAndArea/nAndDelay）而不是 LUT 参数。*/
+        //默认为0
         pCut->fAndCut = fUseAndCut && pCut->nLeaves == 2 && pCut->pLeaves[0] == pObj->pFanin0->Id && pCut->pLeaves[1] == pObj->pFanin1->Id;
         //assert( pCut->nLeaves != 2 || pCut->pLeaves[0] < pCut->pLeaves[1] );
         //assert( pCut->nLeaves != 2 || pObj->pFanin0->Id < pObj->pFanin1->Id );
         // compute the truth table
-        pCut->iCutFunc = -1;
+        pCut->iCutFunc = -1;    //真值表初始化
         pCut->fCompl = 0;
         if ( p->pPars->fTruth )
         {
@@ -319,6 +336,7 @@ IfMapBestCutDone:
                 fChange = If_CutComputeTruthPerm( p, pCut, pCut0R, pCut1R, fFunc0R, fFunc1R );
             else
                 fChange = If_CutComputeTruth( p, pCut, pCut0, pCut1, pObj->fCompl0, pObj->fCompl1 );
+            //fchange 表示真值表是否发生了变化（减少nleaves），某些过滤和计算依赖于真值表，如果真值表没变就可以跳过了
             if ( p->pPars->fVerbose )
                 p->timeCache[4] += Abc_Clock() - clk;
             if ( !p->pPars->fSkipCutFilter && fChange && If_CutFilter( pCutSet, pCut, fSave0 ) )
@@ -463,11 +481,13 @@ IfMapBestCutDone:
         }
         
         // compute the application-specific cost and depth
+        //用户代价计算，默认为0
         pCut->fUser = (p->pPars->pFuncCost != NULL);
         pCut->Cost = p->pPars->pFuncCost? p->pPars->pFuncCost(p, pCut) : 0;
         if ( pCut->Cost == IF_COST_MAX )
             continue;
         // check if the cut satisfies the required times
+        //延迟计算
         if ( p->pPars->fDelayOpt )
             pCut->Delay = If_CutSopBalanceEval( p, pCut, NULL );
         else if ( p->pPars->fDsdBalance )
@@ -532,12 +552,15 @@ IfMapCutEvalDone:
         else if( p->pPars->nGateSize > 0 )
             pCut->Delay = If_CutDelaySop( p, pCut );
         else 
-            pCut->Delay = If_CutDelay( p, pObj, pCut );
+            pCut->Delay = If_CutDelay( p, pObj, pCut );     // ← 标准路径径延迟计算，其他的 delay 计算都是在特定模式下的替代方案
+
         if ( pCut->Delay == -1 )
+            continue;  // 门限过滤，如果 delay 计算失败（比如某些特殊函数没有库支持），就跳过该 cut
+        if ( Mode && pCut->Delay > pObj->Required + p->fEpsilon && pCutSet->nCuts > 0 ) //非首轮且当前 cut 延迟超过要求，且 cut 集合里已经有 cut 了（如果集合里没有 cut 就不跳过，因为至少要保留一个 cut）
             continue;
-        if ( Mode && pCut->Delay > pObj->Required + p->fEpsilon && pCutSet->nCuts > 0 )
-            continue;
+
         // compute area of the cut (this area may depend on the application specific cost)
+        //Area / Edge / Power 计算，Mode == 2 时用 deref 版本，Mode == 1 时用 flow 版本，Mode == 0 时不更新 area/edge/power 参数（保持之前的值），这是因为 Mode == 0 是预处理阶段，预处理阶段计算的 area/edge/power 可能不准确或者没有意义，所以等到 Mode == 1 或 2 的正式映射阶段再计算。
         pCut->Area = (Mode == 2)? If_CutAreaDerefed( p, pCut ) : If_CutAreaFlow( p, pCut );
         if ( p->pPars->fEdge )
             pCut->Edge = (Mode == 2)? If_CutEdgeDerefed( p, pCut ) : If_CutEdgeFlow( p, pCut );
@@ -545,15 +568,19 @@ IfMapCutEvalDone:
             pCut->Power = (Mode == 2)? If_CutPowerDerefed( p, pCut, pObj ) : If_CutPowerFlow( p, pCut, pObj );
 //        pCut->AveRefs = (Mode == 0)? (float)0.0 : If_CutAverageRefs( p, pCut );
         // insert the cut into storage
+
+        //排序插入
         If_CutSort( p, pCutSet, pCut );
 //        If_CutTraverse( p, pObj, pCut );
     } 
+    //双层循环结束
     assert( pCutSet->nCuts > 0 );
 //    If_CutVerifyCuts( pCutSet, !p->pPars->fUseTtPerm );
 
     // update the best cut
     if ( !fPreprocess || pCutSet->ppCuts[0]->Delay <= pObj->Required + p->fEpsilon )
     {
+        //在 preprocess 轮中有额外条件：只有 delay 满足约束时才更新，否则保留上轮结果。
         If_CutCopy( p, If_ObjCutBest(pObj), pCutSet->ppCuts[0] );
         if ( p->pPars->fUserRecLib || p->pPars->fUserSesLib )
             assert(If_ObjCutBest(pObj)->Cost < IF_COST_MAX && If_ObjCutBest(pObj)->Delay < ABC_INFINITY);
@@ -600,12 +627,14 @@ IfMapCutEvalDone:
 void If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPreprocess )
 {
     If_Set_t * pCutSet;
-    If_Obj_t * pTemp;
+    If_Obj_t * pTemp;   //遍历choice等价链的游标
     If_Cut_t * pCutTemp, * pCut;
+    //fsave0默认为0
     int i, fSave0 = p->pPars->fDelayOpt || p->pPars->fDelayOptLut || p->pPars->fDsdBalance || p->pPars->fUserRecLib || p->pPars->fUserSesLib || p->pPars->fUse34Spec || p->pPars->fUserLutDec || p->pPars->fUserLut2D || p->pPars->fEnableCheck07;
     assert( pObj->pEquiv != NULL );
 
     // prepare
+    //area deref，和 MappingAnd 完全一样的模式：在重新评估前，先把当前 best cut 的面积贡献从全局统计中"扣除"，避免重复计算。
     if ( Mode && pObj->nRefs > 0 )
         If_CutAreaDeref( p, If_ObjCutBest(pObj) );
 
@@ -658,6 +687,7 @@ void If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fP
     if ( !fPreprocess || pCutSet->ppCuts[0]->Delay <= pObj->Required + p->fEpsilon )
         If_CutCopy( p, If_ObjCutBest(pObj), pCutSet->ppCuts[0] );
     // add the trivial cut to the set
+    //只给 representative 恢复 trivial cut。等价节点的 trivial cut 不需要恢复（它们的 cutset 马上会被释放）。
     if ( !pObj->fSkipCut && If_ObjCutBest(pObj)->nLeaves > 1 )
     {
         If_ManSetupCutTriv( p, pCutSet->ppCuts[pCutSet->nCuts++], pObj->Id );
@@ -668,7 +698,8 @@ void If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fP
     if ( Mode && pObj->nRefs > 0 )
         If_CutAreaRef( p, If_ObjCutBest(pObj) );
     // free the cuts
-    If_ManDerefChoiceCutSet( p, pObj );
+    If_ManDerefChoiceCutSet( p, pObj );//释放整条等价链上所有节点的 cutset（不只是 pObj 的）
+
 }
 
 /**Function*************************************************************
@@ -687,7 +718,9 @@ int If_ManPerformMappingRound( If_Man_t * p, int nCutsUsed, int Mode, int fPrepr
     ProgressBar * pProgress = NULL;
     If_Obj_t * pObj;
     int i;
+    int fParHandled = 0;
     abctime clk = Abc_Clock();
+    abctime clkRequired, TimeMapping, TimeRequired;
     float arrTime;
     assert( Mode >= 0 && Mode <= 2 );
     p->nBestCutSmall[0] = p->nBestCutSmall[1] = 0;
@@ -701,11 +734,13 @@ int If_ManPerformMappingRound( If_Man_t * p, int nCutsUsed, int Mode, int fPrepr
     // set the cut number
     p->nCutsUsed   = nCutsUsed;
     p->nCutsMerged = 0;
-    // make sure the visit counters are all zero
+    // make sure visit counters are restored to nVisitsCopy before this round
     If_ManForEachNode( p, pObj, i )
         assert( pObj->nVisits == pObj->nVisitsCopy );
+    if ( !If_ManParRunMappingRound( p, Mode, fPreprocess, fFirst, pLabel, &fParHandled ) )
+        return 0;
     // map the internal nodes
-    if ( p->pManTim != NULL )
+    if ( !fParHandled && p->pManTim != NULL )
     {
         Tim_ManIncrementTravId( p->pManTim );
         If_ManForEachObj( p, pObj, i )
@@ -737,10 +772,10 @@ int If_ManPerformMappingRound( If_Man_t * p, int nCutsUsed, int Mode, int fPrepr
         }
 //        Tim_ManPrint( p->pManTim );
     }
-    else
+    else if ( !fParHandled )
     {
         pProgress = Extra_ProgressBarStart( stdout, If_ManObjNum(p) );
-        If_ManForEachNode( p, pObj, i )
+        If_ManForEachNode( p, pObj, i ) //这里只处理and节点
         {
             Extra_ProgressBarUpdate( pProgress, i, pLabel );
             If_ObjPerformMappingAnd( p, pObj, Mode, fPreprocess, fFirst );
@@ -752,8 +787,21 @@ int If_ManPerformMappingRound( If_Man_t * p, int nCutsUsed, int Mode, int fPrepr
     // make sure the visit counters are all zero
     If_ManForEachNode( p, pObj, i )
         assert( pObj->nVisits == 0 );
+    TimeMapping = Abc_Clock() - clk;
     // compute required times and stats
-    If_ManComputeRequired( p );
+    clkRequired = Abc_Clock();
+    {
+        int fReqParHandled = 0;
+        if ( fParHandled && !If_ManParComputeRequiredStage9( p, IF_PAR_REQUIRED_SOURCE_ROUND, Mode, &fReqParHandled, NULL ) )
+            return 0;
+        if ( !fReqParHandled && !If_ManComputeRequired( p ) )
+            return 0;
+    }
+    TimeRequired = Abc_Clock() - clkRequired;
+    p->Stage0Time.round_mapping_time += TimeMapping;
+    p->Stage0Time.round_required_time += TimeRequired;
+    p->Stage0Time.required_time_total += TimeRequired;
+    p->Stage0Time.nRounds++;
 //    Tim_ManPrint( p->pManTim );
     if ( p->pPars->fVerbose )
     {
@@ -764,6 +812,7 @@ int If_ManPerformMappingRound( If_Man_t * p, int nCutsUsed, int Mode, int fPrepr
         Abc_Print( 1, "Switch = %7.2f.  ", p->dPower );
         Abc_Print( 1, "Cut = %8d.  ", p->nCutsMerged );
         Abc_PrintTime( 1, "T", Abc_Clock() - clk );
+        If_ManStage0TimePrintRound( p, pLabel, Mode, fPreprocess, TimeMapping, TimeRequired );
 //    Abc_Print( 1, "Max number of cuts = %d. Average number of cuts = %5.2f.\n", 
 //        p->nCutsMax, 1.0 * p->nCutsMerged / If_ManAndNum(p) );
     }

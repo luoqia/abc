@@ -59,6 +59,7 @@ ABC_NAMESPACE_HEADER_START
 #define IF_COST_MAX          4095 // ((1<<12)-1)
 
 #define IF_BIG_CHAR ((char)120)
+#define IF_PAR_THREAD_MAX    100
 
 // object types
 typedef enum { 
@@ -77,8 +78,11 @@ typedef enum {
 typedef struct If_Man_t_     If_Man_t;
 typedef struct If_Par_t_     If_Par_t;
 typedef struct If_Obj_t_     If_Obj_t;
+typedef struct If_ParMeta_t_ If_ParMeta_t;
+typedef struct If_ParRuntime_t_ If_ParRuntime_t;
 typedef struct If_Cut_t_     If_Cut_t;
 typedef struct If_Set_t_     If_Set_t;
+typedef struct If_Stage0Timing_t_ If_Stage0Timing_t;
 typedef struct If_LibLut_t_  If_LibLut_t;
 typedef struct If_LibCell_t_ If_LibCell_t;
 typedef struct If_LibBox_t_  If_LibBox_t;
@@ -102,26 +106,26 @@ struct Ifif_Par_t_
 struct If_Par_t_
 {
     // user-controlable parameters
-    int                nLutSize;      // the LUT size
-    int                nCutsMax;      // the max number of cuts
-    int                nFlowIters;    // the number of iterations of area recovery
-    int                nAreaIters;    // the number of iterations of area recovery
+    int                nLutSize;      // the LUT size，-K设置，表示用户指定的 LUT 大小上限；如果为 -1，则默认为 6。
+    int                nCutsMax;      // the max number of cuts，默认为 8，表示每个节点保留的 cut 的最大数量上限；这个值越大，mapping 的质量可能越好，但运行时间也会增加。
+    int                nFlowIters;    // the number of iterations of area recovery，默认为 1，表示 area-flow 轮的迭代次数；这个值越大，mapping 的质量可能越好，但运行时间也会增加。
+    int                nAreaIters;    // the number of iterations of area recovery，默认为 2，表示 area-oriented 轮的迭代次数；这个值越大，mapping 的质量可能越好，但运行时间也会增加。
     int                nGateSize;     // the max size of the AND/OR gate to map into
     int                nNonDecLimit;  // the max size of non-dec nodes
-    float              DelayTarget;   // delay target
+    float              DelayTarget;   // delay target，默认为 -1，表示没有特定的 delay target；如果用户指定了 delay target，mapper 会在 mapping 过程中尝试满足这个目标。
     float              Epsilon;       // value used in comparison floating point numbers
     int                nRelaxRatio;   // delay relaxation ratio
     int                nStructType;   // type of the structure
     int                nAndDelay;     // delay of AND-gate in LUT library units
     int                nAndArea;      // area of AND-gate in LUT library units
     int                nLutDecSize;   // the LUT size for decomposition
-    int                fPreprocess;   // preprossing
-    int                fArea;         // area-oriented mapping
-    int                fFancy;        // a fancy feature
-    int                fExpRed;       // expand/reduce of the best cuts
-    int                fLatchPaths;   // reset timing on latch paths
+    int                fPreprocess;   // preprossing，表示是否先跑一轮 delay/preprocess 轮，建立一个可行的初始 mapping，是否做多起点预处理（Delay → Delay-2 → Area）。默认为 1，表示启用。
+    int                fArea;         // area-oriented mapping，默认为 0，表示默认不启用 area-only 模式；如果启用，mapper 会在 mapping 过程中只关注面积优化，而不考虑 delay。
+    int                fFancy;        // a fancy feature，默认为 0，表示不启用；如果启用，mapper 会在 delay/preprocess 轮的第二轮（Delay-2）使用一个特殊的策略来选择 cut，以期得到更好的 delay。
+    int                fExpRed;       // expand/reduce of the best cuts，默认为 1，表示启用；如果启用，mapper 会在每轮 mapping 之后对当前的 best cuts 做一次 expand/reduce，尝试先把面积往下压。
+    int                fLatchPaths;   // reset timing on latch paths，默认为 0，表示不启用；如果启用，mapper 会把所有非 latch 的输入路径的 arrival time 设置为 -infinity，表示这些路径不受 timing 约束。
     int                fLut6Filter;   // uses filtering of 6-LUT functions
-    int                fEdge;         // uses edge-based cut selection heuristics
+    int                fEdge;         // uses edge-based cut selection heuristics，默认为 1，表示启用；如果启用，mapper 会在 cut 选择时考虑边的权重，以期得到更好的 delay。
     int                fPower;        // uses power-aware cut selection heuristics
     int                fCutMin;       // performs cut minimization by removing functionally reducdant variables
     int                fDelayOpt;     // special delay optimization
@@ -151,8 +155,8 @@ struct If_Par_t_
     int                fHashMapping;  // perform AIG hashing after mapping
     int                fUserLutDec;   // perform Boolean decomposition during mapping
     int                fUserLut2D;    // perform Boolean decomposition during mapping
-    int                fDumpFile;     // dumping truth tables into a file
-    int                fVerbose;      // the verbosity flag
+    int                fDumpFile;     // dumping truth tables into a file，表示是否在 area-oriented 轮的最后一次迭代把所有 cut 的真值表和 cost 信息 dump 到文件里，供后续分析用
+    int                fVerbose;      // the verbosity flag，表示是否在每轮迭代结束后打印当前信息，在 ABC 命令 if 的参数解析里，-v 会切换这个开关
     int                fVerboseTrace; // the verbosity flag
     char *             pLutStruct;    // LUT structure
     int                fEnableStructN;// LUT structure using a new method
@@ -185,6 +189,8 @@ struct If_Par_t_
     int (* pFuncCell2) (If_Man_t *, word *, int, Vec_Str_t *, char **); //  procedure called for cut functions
     int (* pFuncWrite) (If_Man_t *);                                    //  procedure called for cut functions
     void *             pReoMan;       // reordering manager
+    int                fParMap;       // enable parallel mapper path
+    int                nParThreads;   // number of threads requested for parallel mapper
 };
 
 // the LUT library
@@ -209,42 +215,73 @@ struct If_LibCell_t_
     int                pCellPinDelays[IF_MAX_LUTSIZE][IF_MAX_LUTSIZE];
 };
 
+// Stage 0 timing instrumentation. These counters are reporting-only.
+struct If_Stage0Timing_t_
+{
+    abctime            round_mapping_time;
+    abctime            round_required_time;
+    abctime            required_time_total;
+    abctime            required_rebuild_time;
+    abctime            required_rebuild_mode0_time;
+    abctime            required_rebuild_flat_time;
+    abctime            required_init_time;
+    abctime            required_prop_time;
+    abctime            required_prop_and_time;
+    abctime            required_prop_terminal_time;
+    abctime            required_reduce_time;
+    abctime            required_terminal_time;
+    abctime            improve_expand_time;
+    abctime            improve_required_time;
+    abctime            total_mapping_time;
+    abctime            abc_reported_total_time;
+    int                required_skip_count;
+    int                required_skip_noop_improve_count;
+    int                nRounds;
+    int                nImproves;
+};
+
+typedef enum If_ParRequiredSource_t_
+{
+    IF_PAR_REQUIRED_SOURCE_ROUND = 0,
+    IF_PAR_REQUIRED_SOURCE_IMPROVE = 1
+} If_ParRequiredSource_t;
+
 // manager
 struct If_Man_t_
 {
     char *             pName;
     // mapping parameters
     If_Par_t *         pPars;
-    // mapping nodes
+    // mapping nodes，核心数据
     If_Obj_t *         pConst1;       // the constant 1 node
     Vec_Ptr_t *        vCis;          // the primary inputs
     Vec_Ptr_t *        vCos;          // the primary outputs
-    Vec_Ptr_t *        vObjs;         // all objects
-    Vec_Ptr_t *        vObjsRev;      // reverse topological order of objects
-    Vec_Ptr_t *        vTemp;         // temporary array
-    int                nObjs[IF_VOID];// the number of objects by type
-    // various data
+    Vec_Ptr_t *        vObjs;         // all objects，拓扑序
+    Vec_Ptr_t *        vObjsRev;      // reverse topological order of objects，反拓扑序
+    Vec_Ptr_t *        vTemp;         // temporary array，表示当前 mapping 轮次的临时对象数组，主要在 cut 计算过程中使用，避免频繁 malloc/free 导致性能问题。
+    int                nObjs[IF_VOID];// the number of objects by type，按类型统计对象个数
+    // various data，当前 round 的全局结果与控制信号
     int                nLevelMax;     // the max number of AIG levels
-    float              fEpsilon;      // epsilon used for comparison
+    float              fEpsilon;      // epsilon used for comparison，浮点比较容差
     float              RequiredGlo;   // global required times
-    float              RequiredGlo2;  // global required times
-    float              AreaGlo;       // global area
-    int                nNets;         // the sum total of fanins of all LUTs in the mapping
-    float              dPower;        // the sum total of switching activities of all LUTs in the mapping
-    int                nCutsUsed;     // the number of cuts currently used
-    int                nCutsMerged;   // the total number of cuts merged
+    float              RequiredGlo2;  // global required times，顺序映射流程里保存的一份额外全局 required，组合if主流程基本不用
+    float              AreaGlo;       // global area，当前mapping的全局面积
+    int                nNets;         // the sum total of fanins of all LUTs in the mapping，当前mapping的全局网络edge规模
+    float              dPower;        // the sum total of switching activities of all LUTs in the mapping，映射网络的切换活动总和（功耗代理指标）
+    int                nCutsUsed;     // the number of cuts currently used，本轮允许使用的 cut 数阈值，当前组合主路径里几乎不再被读取
+    int                nCutsMerged;   // the total number of cuts merged，本轮 cut merge 次数计数器
     unsigned *         puTemp[4];     // used for the truth table computation
     word *             puTempW;       // used for the truth table computation
-    int                SortMode;      // one of the three sorting modes
+    int                SortMode;      // one of the three sorting modes，cut 排序策略开关。0=delay，1=area/flow，2=fancy 旧策略
     int                fNextRound;    // set to 1 after the first round
-    int                nChoices;      // the number of choice nodes
-    Vec_Int_t *        vSwitching;    // switching activity of each node
+    int                nChoices;      // the number of choice nodes，创建choice节点时递增，主要用于统计
+    Vec_Int_t *        vSwitching;    // switching activity of each node，每个节点的 switching 活动向量
     int                pPerm[3][IF_MAX_LUTSIZE]; // permutations
     unsigned           uSharedMask;   // mask of shared variables
     int                nShared;       // the number of shared variables
     int                fReqTimeWarn;  // warning about exceeding required times was printed
     // SOP balancing
-    Vec_Int_t *        vCover;        // used to compute ISOP
+    Vec_Int_t *        vCover;        // used to compute ISOP，计算 ISOP 时使用
     Vec_Int_t *        vArray;        // intermediate storage
     Vec_Wrd_t *        vAnds;         // intermediate storage
     Vec_Wrd_t *        vOrGate;       // intermediate storage
@@ -256,11 +293,13 @@ struct If_Man_t_
     int                nMaxIters;     // the maximum number of iterations
     int                Period;        // the current value of the clock period (for seq mapping)
     // memory management
-    int                nTruth6Words[IF_MAX_FUNC_LUTSIZE+1];  // the size of the truth table if allocated
+        //每个对象、每个 cut、每个 cutset 的字节大小，驱动内存池精确分配大小
+    int                nTruth6Words[IF_MAX_FUNC_LUTSIZE+1];  // the size of the truth table if allocated，，每种叶子数对应的真值表所需 64-bit word 数量
     int                nPermWords;    // the size of the permutation array (in words)
     int                nObjBytes;     // the size of the object
     int                nCutBytes;     // the size of the cut
     int                nSetBytes;     // the size of the cut set
+        // if mapper 的核心对象与 cutset 内存池，分配时直接从这里拿，回收时直接放回这里，避免频繁 malloc/free 导致的性能问题。
     Mem_Fixed_t *      pMemObj;       // memory manager for objects (entrysize = nEntrySize)
     Mem_Fixed_t *      pMemSet;       // memory manager for sets of cuts (entrysize = nCutSize*(nCutsMax+1))
     If_Set_t *         pMemCi;        // memory for CI cutsets
@@ -274,7 +313,7 @@ struct If_Man_t_
     int                nCutsUselessAll;
     int                nCuts5, nCuts5a;
     If_DsdMan_t *      pIfDsdMan;     // DSD manager
-    Vec_Mem_t *        vTtMem[IF_MAX_FUNC_LUTSIZE+1];   // truth table memory and hash table
+    Vec_Mem_t *        vTtMem[IF_MAX_FUNC_LUTSIZE+1];   // truth table memory and hash table，按叶子数分桶的真值表存储与哈希去重容器
     Vec_Wec_t *        vTtIsops[IF_MAX_FUNC_LUTSIZE+1]; // mapping of truth table into DSD
     Vec_Int_t *        vTtDsds[IF_MAX_FUNC_LUTSIZE+1];  // mapping of truth table into DSD
     Vec_Str_t *        vTtPerms[IF_MAX_FUNC_LUTSIZE+1]; // mapping of truth table into permutations
@@ -290,17 +329,17 @@ struct If_Man_t_
     int                nCacheHits;
     int                nCacheMisses;
     abctime            timeCache[6];
-    int                nBestCutSmall[2];
+    int                nBestCutSmall[2]; //表示轮里“最佳 cut 的叶子数为 0、1、2”的节点计数
     int                nCountNonDec[2];
     Vec_Int_t *        vCutData;      // cut data storage
     int                pArrTimeProfile[IF_MAX_FUNC_LUTSIZE];
-    Vec_Ptr_t *        vVisited;
+    Vec_Ptr_t *        vVisited; // visited objects in the current cut computation
     void *             pUserMan;
     Vec_Int_t *        vDump;
     int                pDumpIns[16];
     Vec_Str_t *        vMarks;
     Vec_Int_t *        vVisited2;
-    Vec_Int_t *        vCuts;
+    Vec_Int_t *        vCuts; //表示在 area-oriented 轮的最后一次迭代把所有 cut 的真值表和 cost 信息 dump 到文件里，供后续分析用，格式是每个 cut 占 16 个 int，前 12 个 int 存真值表（最多 192 位），第 13 个 int 存 cost，第 14、15 个 int 暂时没用。
     Vec_Int_t *        vCutCosts;
     // current cut context for user callbacks
     If_Obj_t *         pCutObjCur;    // current object whose cut is being checked
@@ -319,30 +358,86 @@ struct If_Man_t_
     int                nTableEntries[2]; // hash table entries
     void **            pHashTable[2];    // hash table bins
     Mem_Fixed_t *      pMemEntries;      // memory manager for hash table entries
-    // statistics 
+    If_ParMeta_t *     pParMeta;      // Stage 1 parallel preflight metadata
+    If_ParRuntime_t *  pParRuntime;   // parallel mapper runtime
+    If_Stage0Timing_t  Stage0Time;        // reporting-only timing split
+    // statistics
 //    abctime                timeTruth;
 };
+
+static inline double If_ManStage0TimeSec( abctime Time )
+{
+    return 1.0 * (double)Time / (double)CLOCKS_PER_SEC;
+}
+
+static inline void If_ManStage0TimeReset( If_Man_t * p )
+{
+    memset( &p->Stage0Time, 0, sizeof(p->Stage0Time) );
+}
+
+static inline void If_ManStage0TimePrintRound( If_Man_t * p, char * pLabel, int Mode, int fPreprocess, abctime TimeMapping, abctime TimeRequired )
+{
+    if ( !p->pPars->fVerbose )
+        return;
+    Abc_Print( 1, "IF_STAGE0_TIMER kind=round label=%s mode=%d preprocess=%d round_mapping_time=%.6f round_required_time=%.6f\n",
+        pLabel ? pLabel : "none", Mode, fPreprocess, If_ManStage0TimeSec(TimeMapping), If_ManStage0TimeSec(TimeRequired) );
+}
+
+static inline void If_ManStage0TimePrintImprove( If_Man_t * p, abctime TimeExpand, abctime TimeRequired )
+{
+    if ( !p->pPars->fVerbose )
+        return;
+    Abc_Print( 1, "IF_STAGE0_TIMER kind=improve improve_expand_time=%.6f improve_required_time=%.6f\n",
+        If_ManStage0TimeSec(TimeExpand), If_ManStage0TimeSec(TimeRequired) );
+}
+
+static inline void If_ManStage0TimePrintSummary( If_Man_t * p )
+{
+    if ( !p->pPars->fVerbose )
+        return;
+    Abc_Print( 1, "IF_STAGE0_TIMER kind=summary round_mapping_time=%.6f round_required_time=%.6f required_time_total=%.6f required_rebuild_time=%.6f required_rebuild_mode0_time=%.6f required_rebuild_flat_time=%.6f required_init_time=%.6f required_prop_time=%.6f required_prop_and_time=%.6f required_prop_terminal_time=%.6f required_reduce_time=%.6f required_terminal_time=%.6f required_skip_count=%d required_skip_noop_improve_count=%d improve_expand_time=%.6f improve_required_time=%.6f total_mapping_time=%.6f abc_reported_total_time=%.6f round_count=%d improve_count=%d\n",
+        If_ManStage0TimeSec(p->Stage0Time.round_mapping_time),
+        If_ManStage0TimeSec(p->Stage0Time.round_required_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_time_total),
+        If_ManStage0TimeSec(p->Stage0Time.required_rebuild_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_rebuild_mode0_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_rebuild_flat_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_init_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_prop_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_prop_and_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_prop_terminal_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_reduce_time),
+        If_ManStage0TimeSec(p->Stage0Time.required_terminal_time),
+        p->Stage0Time.required_skip_count,
+        p->Stage0Time.required_skip_noop_improve_count,
+        If_ManStage0TimeSec(p->Stage0Time.improve_expand_time),
+        If_ManStage0TimeSec(p->Stage0Time.improve_required_time),
+        If_ManStage0TimeSec(p->Stage0Time.total_mapping_time),
+        If_ManStage0TimeSec(p->Stage0Time.abc_reported_total_time),
+        p->Stage0Time.nRounds,
+        p->Stage0Time.nImproves );
+}
 
 // priority cut
 struct If_Cut_t_
 {
     float              Area;          // area (or area-flow) of the cut
-    float              Edge;          // the edge flow
+    float              Edge;          // the edge flow，（映射网络的总连线数代理指标）
     float              Power;         // the power flow
     float              Delay;         // delay of the cut
-    word               Config;        // configuration string
-    int                iCutFunc;      // TT ID of the cut
-    int                uMaskFunc;     // polarity bitmask
-    unsigned           uSign;         // cut signature
+    word               Config;        // configuration string，配置字符串（用于架构化LUT映射），某些高级映射模式（如 LUT 结构分解 pLutStruct）会在这里存放分解方案的编码，普通映射不用。
+    int                iCutFunc;      // TT ID of the cut，cut函数的真值表id，默认为 -1，表示没有计算真值表；如果计算了真值表，这里存放真值表在全局真值表内存中的 id。
+    int                uMaskFunc;     // polarity bitmask，极性位掩码，某些高级映射模式用来记录每个叶子变量的极性信息
+    unsigned           uSign;         // cut signature，cut签名。表示 cut 的叶子节点 ID 的位掩码，1 表示对应位置的叶子节点在 cut 里，0 表示不在 cut 里
     unsigned           Cost    : 12;  // the user's cost of the cut (related to IF_COST_MAX)
-    unsigned           fCompl  :  1;  // the complemented attribute 
+    unsigned           fCompl  :  1;  // the complemented attribute ，表示 cut 的函数是否取反，0 表示不取反，1 表示取反，默认为0
     unsigned           fUser   :  1;  // using the user's area and delay
     unsigned           fUseless:  1;  // cannot be used in the mapping
-    unsigned           fAndCut :  1;  // matched with AND gate
+    unsigned           fAndCut :  1;  // matched with AND gate，该cut对应简单的and门而非完整lut
     unsigned           nLimit  :  8;  // the maximum number of leaves
     unsigned           nLeaves :  8;  // the number of leaves
-    unsigned           decDelay: 16;  // pin-to-pin decomposition delay
-    int                pLeaves[0];
+    unsigned           decDelay: 16;  // pin-to-pin decomposition delay，引脚级分解延迟
+    int                pLeaves[0];      //叶子节点id列表，cut的叶子节点id列表，长度为 nLeaves，存放在结构体末尾以实现变长结构体。
 };
 
 // set of priority cut
@@ -358,11 +453,11 @@ struct If_Set_t_
 struct If_Obj_t_
 {
     unsigned           Type    :  4;  // object
-    unsigned           fCompl0 :  1;  // complemented attribute
+    unsigned           fCompl0 :  1;  // complemented attribute，If_Obj_t 上存储的 fanin edge complement 标记，0 表示正常边，1 表示反相边；这个字段主要在某些特殊映射模式（如 LUT 结构分解 pLutStruct）中使用，用来记录节点的 fanin edge 的 complement 信息，以便在映射过程中正确处理。
     unsigned           fCompl1 :  1;  // complemented attribute
-    unsigned           fPhase  :  1;  // phase of the node
-    unsigned           fRepr   :  1;  // representative of the equivalence class
-    unsigned           fMark   :  1;  // multipurpose mark
+    unsigned           fPhase  :  1;  // phase of the node，表示节点的相位信息，0 表示正常相位，1 表示反相位；这个字段主要在某些特殊映射模式（如 LUT 结构分解 pLutStruct）中使用，用来记录节点的相位信息，以便在映射过程中正确处理。
+    unsigned           fRepr   :  1;  // representative of the equivalence class，在 choice 节点里指向同一功能的代表节点
+    unsigned           fMark   :  1;  // multipurpose mark，fMark 标记的是 pObj 到叶子之间的 cone 以及叶子本身，用于区分"cone 内"和"cone 外"
     unsigned           fVisit  :  1;  // multipurpose mark
     unsigned           fSpec   :  1;  // multipurpose mark
     unsigned           fDriver :  1;  // multipurpose mark
@@ -370,13 +465,13 @@ struct If_Obj_t_
     unsigned           Level   : 19;  // logic level of the node
     int                Id;            // integer ID
     int                IdPio;         // integer ID of PIs/POs
-    int                nRefs;         // the number of references
+    int                nRefs;         // the number of references，参考计数
     int                nVisits;       // the number of visits to this node
     int                nVisitsCopy;   // the number of visits to this node
     If_Obj_t *         pFanin0;       // the first fanin 
     If_Obj_t *         pFanin1;       // the second fanin
     If_Obj_t *         pEquiv;        // the choice node
-    float              EstRefs;       // estimated reference counter
+    float              EstRefs;       // estimated reference counter，估计参考计数，area-flow公式的分母
     float              Required;      // required time of the onde
     float              LValue;        // sequential arrival time of the node
     union{
@@ -679,19 +774,28 @@ extern If_Obj_t *      If_ManCreateAnd( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t
 extern If_Obj_t *      If_ManCreateXor( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t * pFan1 );
 extern If_Obj_t *      If_ManCreateMux( If_Man_t * p, If_Obj_t * pFan0, If_Obj_t * pFan1, If_Obj_t * pCtrl );
 extern void            If_ManCreateChoice( If_Man_t * p, If_Obj_t * pRepr );
+extern void            If_ManSetupSet( If_Man_t * p, If_Set_t * pSet );
 extern void            If_ManSetupCutTriv( If_Man_t * p, If_Cut_t * pCut, int ObjId );
 extern void            If_ManSetupCiCutSets( If_Man_t * p );
 extern If_Set_t *      If_ManSetupNodeCutSet( If_Man_t * p, If_Obj_t * pObj );
 extern void            If_ManDerefNodeCutSet( If_Man_t * p, If_Obj_t * pObj );
 extern void            If_ManDerefChoiceCutSet( If_Man_t * p, If_Obj_t * pObj );
 extern void            If_ManSetupSetAll( If_Man_t * p, int nCrossCut );
+/*=== ifPar.c =============================================================*/
+extern int             If_ManParIsSupported( If_Man_t * p, char ** ppReason );
+extern int             If_ManParPrecheck( If_Man_t * p );
+extern int             If_ManParPostcheck( If_Man_t * p );
+extern int             If_ManParRunMappingRound( If_Man_t * p, int Mode, int fPreprocess, int fFirst, char * pLabel, int * pfHandled );
+extern int             If_ManParComputeRequiredStage9( If_Man_t * p, If_ParRequiredSource_t Source, int Mode, int * pfHandled, int * pfSkipped );
+extern int             If_ManParImproveMapping( If_Man_t * p, int * pfHandled );
+extern void            If_ManParFree( If_Man_t * p );
 /*=== ifMap.c =============================================================*/
 extern int *           If_CutArrTimeProfile( If_Man_t * p, If_Cut_t * pCut );
 extern void            If_ObjPerformMappingAnd( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPreprocess, int fFirst );
 extern void            If_ObjPerformMappingChoice( If_Man_t * p, If_Obj_t * pObj, int Mode, int fPreprocess );
 extern int             If_ManPerformMappingRound( If_Man_t * p, int nCutsUsed, int Mode, int fPreprocess, int fFirst, char * pLabel );
 /*=== ifReduce.c ==========================================================*/
-extern void            If_ManImproveMapping( If_Man_t * p );
+extern int             If_ManImproveMapping( If_Man_t * p );
 /*=== ifSat.c ==========================================================*/
 extern void *          If_ManSatBuildXY( int nLutSize );
 extern void *          If_ManSatBuildXYZ( int nLutSize );
@@ -704,7 +808,7 @@ extern int             If_ManPerformMappingSeq( If_Man_t * p );
 extern float           If_CutDelay( If_Man_t * p, If_Obj_t * pObj, If_Cut_t * pCut );
 extern void            If_CutPropagateRequired( If_Man_t * p, If_Obj_t * pObj, If_Cut_t * pCut, float Required );
 extern float           If_ManDelayMax( If_Man_t * p, int fSeq );
-extern void            If_ManComputeRequired( If_Man_t * p );
+extern int             If_ManComputeRequired( If_Man_t * p );
 /*=== ifTruth.c ===========================================================*/
 extern void            If_CutRotatePins( If_Man_t * p, If_Cut_t * pCut );
 extern int             If_CutComputeTruth( If_Man_t * p, If_Cut_t * pCut, If_Cut_t * pCut0, If_Cut_t * pCut1, int fCompl0, int fCompl1 );

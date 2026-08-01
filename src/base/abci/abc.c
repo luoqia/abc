@@ -23102,15 +23102,35 @@ int Abc_CommandIf( Abc_Frame_t * pAbc, int argc, char ** argv )
     char Buffer[100], LutSize[100];
     Abc_Ntk_t * pNtk, * pNtkRes;
     If_Par_t Pars, * pPars = &Pars;
+    char * pEnd;
+    long nParThreads;
     int c;
     pNtk = Abc_FrameReadNtk(pAbc);
     If_ManSetDefaultPars( pPars );
     pPars->pLutLib = (If_LibLut_t *)Abc_FrameReadLibLut();
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFAGRNTXYZUDEWSJqalepmrsdbgxyzuoiktncfvh" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFAGRNTXYZUDEWSJPjqalepmrsdbgxyzuoiktncfvh" ) ) != EOF )
     {
         switch ( c )
         {
+        case 'P':
+            pPars->fParMap ^= 1;
+            break;
+        case 'j':
+            if ( globalUtilOptind >= argc )
+            {
+                Abc_Print( -1, "Command line switch \"-j\" should be followed by a positive integer.\n" );
+                goto usage;
+            }
+            nParThreads = strtol( argv[globalUtilOptind], &pEnd, 10 );
+            if ( pEnd == argv[globalUtilOptind] || *pEnd != '\0' || nParThreads < 1 || nParThreads > IF_PAR_THREAD_MAX )
+            {
+                Abc_Print( -1, "Command line switch \"-j\" should be followed by a positive integer no larger than %d.\n", IF_PAR_THREAD_MAX );
+                goto usage;
+            }
+            pPars->nParThreads = (int)nParThreads;
+            globalUtilOptind++;
+            break;
         case 'K':
             if ( globalUtilOptind >= argc )
             {
@@ -23689,7 +23709,7 @@ usage:
         sprintf(LutSize, "library" );
     else
         sprintf(LutSize, "%d", pPars->nLutSize );
-    Abc_Print( -2, "usage: if [-KCFAGRNTXYZMU num] [-DEW float] [-SJ str] [-qarlepmsdbgxyuoiktnczfvh]\n" );
+    Abc_Print( -2, "usage: if [-KCFAGRNTXYZMU num] [-DEW float] [-SJ str] [-P] [-j num] [-qarlepmsdbgxyuoiktnczfvh]\n" );
     Abc_Print( -2, "\t           performs FPGA technology mapping of the network\n" );
     Abc_Print( -2, "\t-K num   : the number of LUT inputs (2 < num < %d) [default = %s]\n", IF_MAX_LUTSIZE+1, LutSize );
     Abc_Print( -2, "\t-C num   : the max number of priority cuts (0 < num < 2^12) [default = %d]\n", pPars->nCutsMax );
