@@ -39,10 +39,12 @@ namespace ymc
 
 	Abc_Ntk_t *pif(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster,
 				   char *dirName, const char *optScript, const char *mapType,
-				   const char *libPath)
+				   const char *libPath, int nMaxConcurrent, const char *tmpDir,
+				   bool fStrict)
 	{
 		shared_ptr<PartNtk> spPN = make_shared<PartNtk>(pNtk, nParts, sCluster,
-														dirName, optScript, mapType, libPath);
+														dirName, optScript, mapType, libPath,
+														nMaxConcurrent, tmpDir, fStrict);
 		spPN->runPipeline();
 		return spPN->getResNtk();
 	}
@@ -60,7 +62,9 @@ extern "C" int ymc_test_yaig_wrapper()
 }
 
 extern "C" Abc_Ntk_t *ymc_pif_wrapper(Abc_Ntk_t *pNtk, uint32_t nParts,
-									  uint32_t sCluster, char *dirName, char *optScript, char *mapType, char *libPath)
+									  uint32_t sCluster, char *dirName, char *optScript, char *mapType, char *libPath,
+									  int nMaxConcurrent, char *tmpDir, bool fStrict)
 {
-	return ymc::pif(pNtk, nParts, sCluster, dirName, optScript, mapType, libPath);
+	return ymc::pif(pNtk, nParts, sCluster, dirName, optScript, mapType, libPath,
+					nMaxConcurrent, tmpDir, fStrict);
 }

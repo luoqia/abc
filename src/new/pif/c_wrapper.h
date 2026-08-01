@@ -14,6 +14,6 @@ namespace ymc
 
     int hello();
     int test_yaig();
-    Abc_Ntk_t *pif(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster, char *dirName, const char *optScript, const char *mapType);
+    Abc_Ntk_t *pif(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster, char *dirName, const char *optScript, const char *mapType, const char *libPath, int nMaxConcurrent, const char *tmpDir, bool fStrict);
 
 } // for namespace

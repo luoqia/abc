@@ -39,8 +39,11 @@ namespace ymc
 		~PartNtk();
 		PartNtk(Abc_Ntk_t *pNtkOrigin, uint32_t nParts, uint32_t sCluster,
 				char *dirName, const char *optScript = nullptr,
-				const char *mapType = nullptr, const char *libPath = nullptr)
-			: m_nParts(nParts), m_pOriginNtk(pNtkOrigin), m_sCluster(sCluster)
+				const char *mapType = nullptr, const char *libPath = nullptr,
+				int nMaxConcurrent = 0, const char *tmpDir = nullptr,
+				bool fStrict = false)
+			: m_nParts(nParts), m_pOriginNtk(pNtkOrigin), m_sCluster(sCluster),
+			  m_nMaxConcurrent(nMaxConcurrent), m_fStrict(fStrict)
 		{
 			strcpy(m_dirName, dirName);
 			if (optScript && strlen(optScript) > 0)
@@ -48,6 +51,7 @@ namespace ymc
 			m_mapType = (mapType && strlen(mapType) > 0) ? mapType : "";
 			if (libPath && strlen(libPath) > 0)
 				m_libPath = libPath;
+			m_tmpDir = (tmpDir && strlen(tmpDir) > 0) ? tmpDir : "/dev/shm";
 			init();
 		};
 
@@ -92,6 +96,17 @@ namespace ymc
 		std::string m_abcRc;	 // abc.rc 路径
 		std::string m_libPath;	 // 标准单元库路径（ASIC 映射用）
 		bool m_useMffc = true;	 // 使用MFFC-based partition (默认开启)
+
+		// pif engineering hardening (Task 11)
+		int m_nMaxConcurrent = 0;  // -j N: explicit child-process cap; 0 = default policy
+		std::string m_tmpDir;      // -t <dir>: per-child temporary files; default /dev/shm
+		bool m_fStrict = false;    // -e: a failed/missing/malformed child result fails pif
+		bool m_fPipelineFailed = false;
+		int m_nChildOk = 0;        // per-child outcome counters for the final summary
+		int m_nChildFallback = 0;
+		int m_nChildFailure = 0;
+		double m_dChildElapsedSum = 0.0;
+		double m_dChildElapsedMax = 0.0;
 
 		PifTimeStats m_stats;
 	};

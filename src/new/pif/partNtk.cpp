@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <fcntl.h>
 #include <cstdio>
+#include <sys/stat.h>
 #include <linux/limits.h> // PATH_MAX
 #include <libgen.h>		  // dirname
 
@@ -117,10 +118,19 @@ namespace ymc
 			}
 		}
 
+		if (m_tmpDir != "/dev/shm")
+			mkdir(m_tmpDir.c_str(), 0755);
+
 		ylog("ABC binary: %s\n", m_abcBin.c_str());
 		ylog("ABC RC:     %s\n", m_abcRc.c_str());
 		ylog("Opt script: %s\n", m_optScript.c_str());
 		ylog("Map type:   %s\n", m_mapType.c_str());
+		if (m_nMaxConcurrent > 0)
+			ylog("Concurrency cap: %d\n", m_nMaxConcurrent);
+		else
+			ylog("Concurrency cap: default (hw/2)\n");
+		ylog("Task tmp dir:    %s\n", m_tmpDir.c_str());
+		ylog("Strict mode:     %s\n", m_fStrict ? "on" : "off");
 		if (!m_libPath.empty())
 			ylog("Lib path:   %s\n", m_libPath.c_str());
 
@@ -141,6 +151,15 @@ namespace ymc
 
 		// Phase 2: Parallel Optimization + Mapping (Process-based)
 		optimizeSubNtks();
+
+		if (m_fPipelineFailed)
+		{
+			m_pMappedNtk = NULL;
+			auto end_flow = Clock::now();
+			m_stats.timeTotal = std::chrono::duration<double>(end_flow - start_flow).count();
+			printTimeStats();
+			return;
+		}
 
 		// Phase 3: Align & Merge
 		alignInterfaces();
@@ -349,7 +368,8 @@ namespace ymc
 		m_vSubNtksOptimized.resize(nTasks, nullptr);
 		m_stats.timeSubNtksOpt.resize(nTasks);
 
-		int max_concurrent = std::thread::hardware_concurrency() / 2;
+		int max_concurrent = m_nMaxConcurrent > 0 ? m_nMaxConcurrent
+												  : (std::thread::hardware_concurrency() / 2);
 		if (max_concurrent < 1)
 			max_concurrent = 1;
 
@@ -366,12 +386,17 @@ namespace ymc
 				auto end = Clock::now();
 				m_stats.timeSubNtksOpt[idx] = std::chrono::duration<double>(end - task_start_times[idx]).count();
 
-				if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+				bool fChildOk = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+				int nExitStatus = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+				int nSignal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+				bool fReadOk = false;
+				if (fChildOk)
 				{
 					char file_out[256];
-					snprintf(file_out, sizeof(file_out), "/dev/shm/pif_sub_%d_pid%d_opt.blif", idx, my_pid);
+					snprintf(file_out, sizeof(file_out), "%s/pif_sub_%d_pid%d_opt.blif", m_tmpDir.c_str(), idx, my_pid);
 
 					Abc_Ntk_t *pNetlist = Io_ReadBlif(file_out, 1);
+					fReadOk = (pNetlist != NULL);
 					if (pNetlist)
 					{
 						// 根据用户脚本判断是否包含映射命令
@@ -405,11 +430,35 @@ namespace ymc
 					// 清理临时文件
 					remove(file_out);
 					char file_in[256];
-					snprintf(file_in, sizeof(file_in), "/dev/shm/pif_sub_%d_pid%d.blif", idx, my_pid);
+					snprintf(file_in, sizeof(file_in), "%s/pif_sub_%d_pid%d.blif", m_tmpDir.c_str(), idx, my_pid);
 					remove(file_in);
 				}
+				double dElapsed = m_stats.timeSubNtksOpt[idx];
+				int nNodes = Abc_NtkNodeNum(m_vSubNtks[idx]);
+				m_dChildElapsedSum += dElapsed;
+				if (dElapsed > m_dChildElapsedMax)
+					m_dChildElapsedMax = dElapsed;
+
 				if (!m_vSubNtksOptimized[idx])
 				{
+					if (m_fStrict)
+					{
+						m_nChildFailure++;
+						m_fPipelineFailed = true;
+						ylog("[PIF-CHILD] idx=%d nodes=%d pid=%d start=%.4f end=%.4f elapsed=%.4f exit=%d sig=%d read=%d fallback=%d reason=strict_child_error\n",
+							 idx, nNodes, pid,
+							 std::chrono::duration<double>(task_start_times[idx] - start_total).count(),
+							 std::chrono::duration<double>(end - start_total).count(),
+							 dElapsed, nExitStatus, nSignal, (int)fReadOk, (int)false);
+						ylog("[PIF-STRICT] sub %d has no valid optimized result; failing pif per -e.\n", idx);
+						pid_to_idx.erase(pid);
+						return;
+					}
+					ylog("[PIF-CHILD] idx=%d nodes=%d pid=%d start=%.4f end=%.4f elapsed=%.4f exit=%d sig=%d read=%d fallback=%d reason=child_failed\n",
+						 idx, nNodes, pid,
+						 std::chrono::duration<double>(task_start_times[idx] - start_total).count(),
+						 std::chrono::duration<double>(end - start_total).count(),
+						 dElapsed, nExitStatus, nSignal, (int)fReadOk, (int)true);
 					printf("[Warn] Optimization failed/aborted for sub %d, using original.\n", idx);
 					Abc_Ntk_t *pDup = Abc_NtkDup(m_vSubNtks[idx]);
 
@@ -443,8 +492,8 @@ namespace ymc
 						if (pNetlist)
 						{
 							char tmpIn[256], tmpOut[256];
-							snprintf(tmpIn, sizeof(tmpIn), "/dev/shm/pif_fb_%d_pid%d.blif", idx, getpid());
-							snprintf(tmpOut, sizeof(tmpOut), "/dev/shm/pif_fb_%d_pid%d_opt.blif", idx, getpid());
+							snprintf(tmpIn, sizeof(tmpIn), "%s/pif_fb_%d_pid%d.blif", m_tmpDir.c_str(), idx, getpid());
+							snprintf(tmpOut, sizeof(tmpOut), "%s/pif_fb_%d_pid%d_opt.blif", m_tmpDir.c_str(), idx, getpid());
 
 							Io_WriteBlif(pNetlist, tmpIn, 1, 0, 0);
 							Abc_NtkDelete(pNetlist);
@@ -532,6 +581,16 @@ namespace ymc
 					{
 						m_vSubNtksOptimized[idx] = pDup;
 					}
+					m_nChildFallback++;
+				}
+				else
+				{
+					m_nChildOk++;
+					ylog("[PIF-CHILD] idx=%d nodes=%d pid=%d start=%.4f end=%.4f elapsed=%.4f exit=%d sig=%d read=%d fallback=%d reason=ok\n",
+						 idx, nNodes, pid,
+						 std::chrono::duration<double>(task_start_times[idx] - start_total).count(),
+						 std::chrono::duration<double>(end - start_total).count(),
+						 dElapsed, nExitStatus, nSignal, (int)fReadOk, (int)false);
 				}
 				pid_to_idx.erase(pid);
 			}
@@ -599,8 +658,8 @@ namespace ymc
 					}
 
 					char tmpIn[256], tmpOut[256];
-					snprintf(tmpIn, sizeof(tmpIn), "/dev/shm/pif_small_%d_pid%d.blif", i, getpid());
-					snprintf(tmpOut, sizeof(tmpOut), "/dev/shm/pif_small_%d_pid%d_opt.blif", i, getpid());
+					snprintf(tmpIn, sizeof(tmpIn), "%s/pif_small_%d_pid%d.blif", m_tmpDir.c_str(), i, getpid());
+					snprintf(tmpOut, sizeof(tmpOut), "%s/pif_small_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, getpid());
 
 					// 写出临时 blif (重定向 stdout 抑制 ABC 日志)
 					fflush(stdout);
@@ -694,8 +753,8 @@ namespace ymc
 									}
 									{
 										char tmpIn2[256], tmpOut2[256];
-										snprintf(tmpIn2, sizeof(tmpIn2), "/dev/shm/pif_small_fb_%d_pid%d.blif", i, getpid());
-										snprintf(tmpOut2, sizeof(tmpOut2), "/dev/shm/pif_small_fb_%d_pid%d_opt.blif", i, getpid());
+										snprintf(tmpIn2, sizeof(tmpIn2), "%s/pif_small_fb_%d_pid%d.blif", m_tmpDir.c_str(), i, getpid());
+										snprintf(tmpOut2, sizeof(tmpOut2), "%s/pif_small_fb_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, getpid());
 										fflush(stdout);
 										int orig_stdout_s2 = dup(STDOUT_FILENO);
 										int dev_null_s2 = open("/dev/null", O_WRONLY);
@@ -777,8 +836,19 @@ namespace ymc
 									}
 									if (!m_vSubNtksOptimized[i])
 									{
-										m_vSubNtksOptimized[i] = pFB;
-										ylog("[Warn] Small sub %d mapping produced non-mapped result\n", i);
+										if (m_fStrict)
+										{
+											m_nChildFailure++;
+											m_fPipelineFailed = true;
+											ylog("[PIF-STRICT] small sub %d mapping produced a non-mapped result; failing pif per -e.\n", i);
+											if (pFB)
+												Abc_NtkDelete(pFB);
+										}
+										else
+										{
+											m_vSubNtksOptimized[i] = pFB;
+											ylog("[Warn] Small sub %d mapping produced non-mapped result\n", i);
+										}
 									}
 								}
 							}
@@ -794,8 +864,8 @@ namespace ymc
 							}
 							{
 								char tmpIn2[256], tmpOut2[256];
-								snprintf(tmpIn2, sizeof(tmpIn2), "/dev/shm/pif_small_fb_%d_pid%d.blif", i, getpid());
-								snprintf(tmpOut2, sizeof(tmpOut2), "/dev/shm/pif_small_fb_%d_pid%d_opt.blif", i, getpid());
+								snprintf(tmpIn2, sizeof(tmpIn2), "%s/pif_small_fb_%d_pid%d.blif", m_tmpDir.c_str(), i, getpid());
+								snprintf(tmpOut2, sizeof(tmpOut2), "%s/pif_small_fb_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, getpid());
 								fflush(stdout);
 								int orig_stdout_s2 = dup(STDOUT_FILENO);
 								int dev_null_s2 = open("/dev/null", O_WRONLY);
@@ -877,8 +947,19 @@ namespace ymc
 							}
 							if (!m_vSubNtksOptimized[i])
 							{
-								m_vSubNtksOptimized[i] = pFB;
-								ylog("[Warn] Small sub %d fork mapping failed\n", i);
+								if (m_fStrict)
+								{
+									m_nChildFailure++;
+									m_fPipelineFailed = true;
+									ylog("[PIF-STRICT] small sub %d fork mapping failed; failing pif per -e.\n", i);
+									if (pFB)
+										Abc_NtkDelete(pFB);
+								}
+								else
+								{
+									m_vSubNtksOptimized[i] = pFB;
+									ylog("[Warn] Small sub %d fork mapping failed\n", i);
+								}
 							}
 						}
 					}
@@ -889,6 +970,8 @@ namespace ymc
 				continue;
 			}
 			// 大子网: 走 fork 子进程
+			if (m_fPipelineFailed)
+				break;
 
 			while (running_procs >= max_concurrent)
 			{
@@ -903,8 +986,8 @@ namespace ymc
 
 			task_start_times[i] = Clock::now();
 			char file_in[256], file_out[256];
-			snprintf(file_in, sizeof(file_in), "/dev/shm/pif_sub_%d_pid%d.blif", i, my_pid);
-			snprintf(file_out, sizeof(file_out), "/dev/shm/pif_sub_%d_pid%d_opt.blif", i, my_pid);
+			snprintf(file_in, sizeof(file_in), "%s/pif_sub_%d_pid%d.blif", m_tmpDir.c_str(), i, my_pid);
+			snprintf(file_out, sizeof(file_out), "%s/pif_sub_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, my_pid);
 			remove(file_in);
 
 			// 重定向 stdout 到 /dev/null，抑制子进程产生的 ABC 日志
@@ -984,6 +1067,9 @@ namespace ymc
 
 		auto end_total = Clock::now();
 		m_stats.timeOptTotal = std::chrono::duration<double>(end_total - start_total).count();
+		if (m_fPipelineFailed)
+			ylog("[PIF-STRICT] pif pipeline failed: ok=%d fallback=%d failure=%d\n",
+				 m_nChildOk, m_nChildFallback, m_nChildFailure);
 	}
 
 	void PartNtk::alignInterfaces()
@@ -1307,6 +1393,15 @@ namespace ymc
 			printf("      * Processes:                %lu\n", m_stats.timeSubNtksOpt.size());
 			printf("      * Workload Stats (s):       Max=%.4f, Avg=%.4f, Sum=%.4f\n", max, avg, sum);
 			printf("      * Load Balance:             %.1f%% (Avg/Max)\n", calc_balance(avg, max));
+		}
+		printf("      * Child Outcomes:            ok=%d fallback=%d failure=%d\n",
+			   m_nChildOk, m_nChildFallback, m_nChildFailure);
+		printf("      * Child Elapsed (s):         Max=%.4f, Sum=%.4f\n",
+			   m_dChildElapsedMax, m_dChildElapsedSum);
+		{
+			double wall = m_stats.timeOptTotal > 1e-9 ? m_stats.timeOptTotal : 1.0;
+			printf("      * Effective Concurrency:    %.2f (sum_elapsed/phase_wall)\n",
+				   m_dChildElapsedSum / wall);
 		}
 		printf("      * Script: %s\n", m_optScript.c_str());
 		printf("----------------------------------------------------------\n");

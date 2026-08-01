@@ -696,7 +696,7 @@ extern "C" {
 int ymc_hello_wrapper();
 int ymc_try_metis_wrapper();
 int ymc_test_yaig_wrapper();
-Abc_Ntk_t *ymc_pif_wrapper(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster, char *dirName, char *optScript, char *mapType, char *libPath);
+Abc_Ntk_t *ymc_pif_wrapper(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster, char *dirName, char *optScript, char *mapType, char *libPath, int nMaxConcurrent, char *tmpDir, bool fStrict);
 #ifdef __cplusplus
 }
 #endif
@@ -735,9 +735,12 @@ static int Abc_CommandPif(Abc_Frame_t *pAbc, int argc, char **argv)
 	char *optScript = NULL;
 	char *mapType = NULL;
 	char *libPath = NULL;
+	int nMaxConcurrent = 0;
+	char *tmpDir = NULL;
+	bool fStrict = false;
 
 	Extra_UtilGetoptReset();
-	while ((c = Extra_UtilGetopt(argc, argv, "NsdSmLh")) != EOF) {
+	while ((c = Extra_UtilGetopt(argc, argv, "NsdSmLjthe")) != EOF) {
 		switch (c) {
 		case 'N':
 			if (globalUtilOptind >= argc) {
@@ -798,6 +801,31 @@ static int Abc_CommandPif(Abc_Frame_t *pAbc, int argc, char **argv)
 			libPath = argv[globalUtilOptind];
 			globalUtilOptind++;
 			break;
+		case 'j':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-j\" should be followed by a positive integer.\n");
+				goto usage;
+			}
+			nMaxConcurrent = atoi(argv[globalUtilOptind]);
+			globalUtilOptind++;
+			if (nMaxConcurrent < 1 || nMaxConcurrent > 1024) {
+				Abc_Print(-1, "Invalid concurrency cap (1 <= -j <= 1024).\n");
+				goto usage;
+			}
+			Abc_Print(-2, "Child-process concurrency cap: %d.\n", nMaxConcurrent);
+			break;
+		case 't':
+			if (globalUtilOptind >= argc) {
+				Abc_Print(-1, "Command line switch \"-t\" should be followed by a directory path.\n");
+				goto usage;
+			}
+			tmpDir = argv[globalUtilOptind];
+			globalUtilOptind++;
+			break;
+		case 'e':
+			fStrict = true;
+			Abc_Print(-2, "Strict child-error mode enabled: a failed child result fails pif.\n");
+			break;
 		case 'h':
 			goto usage;
 		default:
@@ -844,7 +872,8 @@ static int Abc_CommandPif(Abc_Frame_t *pAbc, int argc, char **argv)
 			return 1;
 		}
 
-		pNtkRes = ymc_pif_wrapper(pNtk, nParts, sCluster, dirName, optScript, mapType, libPath);
+		pNtkRes = ymc_pif_wrapper(pNtk, nParts, sCluster, dirName, optScript, mapType, libPath,
+								  nMaxConcurrent, tmpDir, fStrict);
 		if (pNtkRes == NULL) {
 			Abc_Print(-1, "pif has failed.\n");
 			return 1;
@@ -857,7 +886,7 @@ static int Abc_CommandPif(Abc_Frame_t *pAbc, int argc, char **argv)
 	return 0;
 
 usage:
-	Abc_Print(-2, "usage: pif [-N num] [-d dir] [-s size] [-S script] [-m type] [-h]\n");
+	Abc_Print(-2, "usage: pif [-N num] [-d dir] [-s size] [-S script] [-m type] [-j num] [-t dir] [-e] [-h]\n");
 	Abc_Print(-2, "\t           partition-based parallel optimization and mapping\n");
 	Abc_Print(-2, "\t-N num   : the number of partitions [default = adaptive]\n");
 	Abc_Print(-2, "\t-d dir   : the output directory for intermediate files\n");
@@ -866,6 +895,9 @@ usage:
 	Abc_Print(-2, "\t           [default = \"strash; dc2; fraig; resyn2; if -K 6 -C 8\"]\n");
 	Abc_Print(-2, "\t-m type  : mapping type: fpga or asic [default = fpga]\n");
 	Abc_Print(-2, "\t-L file  : standard cell library (.genlib) for ASIC mapping\n");
+	Abc_Print(-2, "\t-j num   : explicit maximum child-process concurrency [default = hw/2]\n");
+	Abc_Print(-2, "\t-t dir   : task temporary directory for per-child files [default = /dev/shm]\n");
+	Abc_Print(-2, "\t-e       : strict child-error mode: a failed/missing/malformed child result fails pif\n");
 	Abc_Print(-2, "\t-h       : print the command usage\n");
 	return 1;
 }
