@@ -2812,8 +2812,10 @@ namespace ymc
 		// 1. 创建一个普通的新节点
 		Abc_Obj_t *pNode = Abc_NtkCreateNode(pNtk);
 
-		// 2. 如果有工艺库，赋予它 Const0 门的数据
-		if (pNtk->pManFunc)
+		// 2. 如果有工艺库(Mapping 网络)，赋予它 Const0 门的数据。
+		//    仅当网络是 ABC_FUNC_MAP 时 pManFunc 才是 Mio_Library；
+		//    对 AIG/SOP 网络 pManFunc 是 Hop_Man_t/Mem_Flex_t，强制转换会越界读
+		if (pNtk->pManFunc && Abc_NtkHasMapping(pNtk))
 		{
 			Mio_Library_t *pLib = (Mio_Library_t *)pNtk->pManFunc;
 			Mio_Gate_t *pGateC0 = Mio_LibraryReadConst0(pLib);
@@ -2838,8 +2840,10 @@ namespace ymc
 		// 1. 创建一个普通的新节点 (ABC_OBJ_NODE)
 		Abc_Obj_t *pNode = Abc_NtkCreateNode(pNtk);
 
-		// 2. 如果有工艺库，赋予它 Const1 门的数据
-		if (pNtk->pManFunc)
+		// 2. 如果有工艺库(Mapping 网络)，赋予它 Const1 门的数据。
+		//    仅当网络是 ABC_FUNC_MAP 时 pManFunc 才是 Mio_Library；
+		//    对 AIG/SOP 网络 pManFunc 是 Hop_Man_t/Mem_Flex_t，强制转换会越界读
+		if (pNtk->pManFunc && Abc_NtkHasMapping(pNtk))
 		{
 			Mio_Library_t *pLib = (Mio_Library_t *)pNtk->pManFunc;
 			Mio_Gate_t *pGateC1 = Mio_LibraryReadConst1(pLib);
