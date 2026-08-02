@@ -13,6 +13,99 @@ using Clock = std::chrono::high_resolution_clock;
 
 namespace ymc
 {
+	// ---------------------------------------------------------------------------
+	// Path-independent result-type contract helpers.
+	// The merge path must never be chosen from the -S value (a file path in the
+	// project flow) or from any directory/filename substring. The primary
+	// classifier is the actual child network; the script CONTENT (read from the
+	// referenced file when readable) is used only for the fallback intent.
+	// ---------------------------------------------------------------------------
+
+	// Primary classifier: 1 if the loaded child network is a mapped result.
+	// A network is mapped when it carries Mio mapping data (ABC_FUNC_MAP) or
+	// when it contains LUT-width gates (nodes with more than 3 fanins, i.e.
+	// K4/K6 LUT truth tables read back from BLIF). AIG/SOP results from
+	// AIG-mode scripts have only 1-3-input gates and take the AIG form.
+	// This is a property of the actual child network, never of the -S value
+	// or any path string.
+	static bool IsMappedLogic(Abc_Ntk_t *pLogic)
+	{
+		if (!pLogic)
+			return false;
+		if (Abc_NtkHasMapping(pLogic))
+			return true;
+		Abc_Obj_t *pObj;
+		int i;
+		Abc_NtkForEachNode(pLogic, pObj, i)
+			if (Abc_ObjFaninNum(pObj) > 3)
+				return true;
+		return false;
+	}
+
+	// Read the -S value as content: file content when the value names a
+	// readable file, otherwise the inline value itself. Never the path string.
+	static std::string OptScriptContent(const std::string &value)
+	{
+		FILE *f = fopen(value.c_str(), "r");
+		if (!f)
+			return value;
+		std::string content;
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+			content.append(buf, n);
+		fclose(f);
+		return content;
+	}
+
+	// Content-based mapping intent: a 'map' or 'if' command token in the script
+	// content decides mapped intent; a dch-only script decides AIG intent.
+	static bool ScriptHasMappingCommand(const std::string &content)
+	{
+		size_t pos = 0;
+		while (pos <= content.size())
+		{
+			size_t semi = content.find(';', pos);
+			std::string cmd = content.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+			size_t b = cmd.find_first_not_of(" \t\r\n");
+			if (b != std::string::npos)
+			{
+				size_t e = cmd.find_first_of(" \t", b);
+				std::string tok = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+				if (tok == "map" || tok == "if")
+					return true;
+			}
+			if (semi == std::string::npos)
+				break;
+			pos = semi + 1;
+		}
+		return false;
+	}
+
+	// Flow mapping intent: explicit -m fpga/asic, else the read script content.
+	static bool FlowIntendsMapped(const std::string &mapType, const std::string &optScript)
+	{
+		if (mapType == "fpga" || mapType == "asic")
+			return true;
+		return ScriptHasMappingCommand(OptScriptContent(optScript));
+	}
+
+	// Normalize a stored child to the AIG form: a STRASH network that the AIG
+	// merge (Abc_NtkMerge) can process. Takes ownership of pNtk on success.
+	static Abc_Ntk_t *ToAigForm(Abc_Ntk_t *pNtk)
+	{
+		if (!pNtk)
+			return nullptr;
+		if (Abc_NtkIsStrash(pNtk))
+			return pNtk;
+		Abc_Ntk_t *pStrash = Abc_NtkStrash(pNtk, 0, 1, 0);
+		if (pStrash)
+		{
+			Abc_NtkDelete(pNtk);
+			return pStrash;
+		}
+		return pNtk;
+	}
 
 	PartNtk::~PartNtk()
 	{
@@ -399,17 +492,10 @@ namespace ymc
 					fReadOk = (pNetlist != NULL);
 					if (pNetlist)
 					{
-						// 根据用户脚本判断是否包含映射命令
+						// 分类依据是实际子网网络, 与 -S 值/路径/文件名无关
 						bool isMappedResult = false;
-						if (m_mapType == "fpga" || m_mapType == "asic")
-							isMappedResult = true;
-						else if (m_mapType.empty())
-							isMappedResult = (m_optScript.find("map") != std::string::npos) ||
-											 (m_optScript.find("if ") != std::string::npos) ||
-											 (m_optScript.find("if;") != std::string::npos) ||
-											 (m_optScript.find("if -") != std::string::npos);
-
 						Abc_Ntk_t *pLogic = Abc_NtkToLogic(pNetlist);
+						isMappedResult = IsMappedLogic(pLogic);
 						Abc_NtkDelete(pNetlist);
 
 						if (pLogic)
@@ -470,14 +556,8 @@ namespace ymc
 					}
 
 					// 映射模式下: 在父进程中执行映射, 保证产出 ABC_FUNC_MAP
-					bool isMappedFallback = false;
-					if (m_mapType == "fpga" || m_mapType == "asic")
-						isMappedFallback = true;
-					else if (m_mapType.empty())
-						isMappedFallback = (m_optScript.find("map") != std::string::npos) ||
-										   (m_optScript.find("if ") != std::string::npos) ||
-										   (m_optScript.find("if;") != std::string::npos) ||
-										   (m_optScript.find("if -") != std::string::npos);
+					// 意图判断: 显式 -m, 否则读取脚本内容(文件或内联)判断
+					bool isMappedFallback = FlowIntendsMapped(m_mapType, m_optScript);
 
 					if (isMappedFallback && pDup && !Abc_NtkHasMapping(pDup))
 					{
@@ -510,8 +590,7 @@ namespace ymc
 							char cmd[2048];
 							if (!m_libPath.empty())
 							{
-								if (m_mapType == "asic" ||
-									(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+								if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 									snprintf(cmd, sizeof(cmd),
 											 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 											 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn, tmpOut);
@@ -522,8 +601,7 @@ namespace ymc
 							}
 							else
 							{
-								if (m_mapType == "asic" ||
-									(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+								if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 									snprintf(cmd, sizeof(cmd),
 											 "source %s; read_blif %s; strash; map; write_blif %s",
 											 m_abcRc.c_str(), tmpIn, tmpOut);
@@ -574,12 +652,13 @@ namespace ymc
 						// 如果上面没成功, pDup 仍然有效
 						if (!m_vSubNtksOptimized[idx])
 						{
-							m_vSubNtksOptimized[idx] = pDup;
+							// 非映射意图: 存 STRASH, 保证 AIG 合并安全
+							m_vSubNtksOptimized[idx] = isMappedFallback ? pDup : ToAigForm(pDup);
 						}
 					}
 					else
 					{
-						m_vSubNtksOptimized[idx] = pDup;
+						m_vSubNtksOptimized[idx] = isMappedFallback ? pDup : ToAigForm(pDup);
 					}
 					m_nChildFallback++;
 				}
@@ -596,24 +675,19 @@ namespace ymc
 			}
 		};
 
-		// 判断是否包含映射命令
-		bool isMappedFlow = false;
-		if (m_mapType == "fpga" || m_mapType == "asic")
-			isMappedFlow = true;
-		else if (m_mapType.empty())
-			isMappedFlow = (m_optScript.find("map") != std::string::npos) ||
-						   (m_optScript.find("if ") != std::string::npos) ||
-						   (m_optScript.find("if;") != std::string::npos) ||
-						   (m_optScript.find("if -") != std::string::npos);
+		// 意图判断: 显式 -m, 否则读取脚本内容(文件或内联)判断
+		bool isMappedFlow = FlowIntendsMapped(m_mapType, m_optScript);
 
 		for (int i = 0; i < nTasks; ++i)
 		{
 			// === 空子网: 无论什么模式都直接跳过 ===
 			if (Abc_NtkNodeNum(m_vSubNtks[i]) == 0)
 			{
-				// 空子网: 创建一个空的 logic 网络占位
+				// 空子网: 非映射意图存 STRASH, 映射意图存 logic
 				Abc_Ntk_t *pDup = Abc_NtkDup(m_vSubNtks[i]);
-				if (Abc_NtkIsStrash(pDup))
+				if (!isMappedFlow)
+					m_vSubNtksOptimized[i] = ToAigForm(pDup);
+				else if (Abc_NtkIsStrash(pDup))
 				{
 					Abc_Ntk_t *pLogic = Abc_NtkToLogic(pDup);
 					Abc_NtkDelete(pDup);
@@ -632,18 +706,9 @@ namespace ymc
 			{
 				if (!isMappedFlow)
 				{
-					// 非映射模式: 直接转 logic 即可
+					// 非映射模式: 保持 STRASH, AIG 合并需要 STRASH 子网
 					Abc_Ntk_t *pDup = Abc_NtkDup(m_vSubNtks[i]);
-					if (Abc_NtkIsStrash(pDup))
-					{
-						Abc_Ntk_t *pLogic = Abc_NtkToLogic(pDup);
-						Abc_NtkDelete(pDup);
-						m_vSubNtksOptimized[i] = pLogic;
-					}
-					else
-					{
-						m_vSubNtksOptimized[i] = pDup;
-					}
+					m_vSubNtksOptimized[i] = ToAigForm(pDup);
 				}
 				else
 				{
@@ -689,8 +754,7 @@ namespace ymc
 					char cmd[2048];
 					if (!m_libPath.empty())
 					{
-						if (m_mapType == "asic" ||
-							(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+						if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 							snprintf(cmd, sizeof(cmd),
 									 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 									 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn, tmpOut);
@@ -701,8 +765,7 @@ namespace ymc
 					}
 					else
 					{
-						if (m_mapType == "asic" ||
-							(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+						if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 							snprintf(cmd, sizeof(cmd),
 									 "source %s; read_blif %s; strash; map; write_blif %s",
 									 m_abcRc.c_str(), tmpIn, tmpOut);
@@ -777,8 +840,7 @@ namespace ymc
 										char cmd2[2048];
 										if (!m_libPath.empty())
 										{
-											if (m_mapType == "asic" ||
-												(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+											if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 												snprintf(cmd2, sizeof(cmd2),
 														 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 														 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn2, tmpOut2);
@@ -789,8 +851,7 @@ namespace ymc
 										}
 										else
 										{
-											if (m_mapType == "asic" ||
-												(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+											if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 												snprintf(cmd2, sizeof(cmd2),
 														 "source %s; read_blif %s; strash; map; write_blif %s",
 														 m_abcRc.c_str(), tmpIn2, tmpOut2);
@@ -888,8 +949,7 @@ namespace ymc
 								char cmd2[2048];
 								if (!m_libPath.empty())
 								{
-									if (m_mapType == "asic" ||
-										(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+									if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 										snprintf(cmd2, sizeof(cmd2),
 												 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 												 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn2, tmpOut2);
@@ -900,8 +960,7 @@ namespace ymc
 								}
 								else
 								{
-									if (m_mapType == "asic" ||
-										(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+									if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 										snprintf(cmd2, sizeof(cmd2),
 												 "source %s; read_blif %s; strash; map; write_blif %s",
 												 m_abcRc.c_str(), tmpIn2, tmpOut2);
@@ -1143,20 +1202,37 @@ namespace ymc
 
 	void PartNtk::mergeAndOutput()
 	{
-		// isMapped 判断（和第2处逻辑完全一样）：
-		bool isMapped = false;
-		if (m_mapType == "fpga" || m_mapType == "asic")
-			isMapped = true;
-		else if (m_mapType.empty())
-			isMapped = (m_optScript.find("map") != std::string::npos) ||
-					   (m_optScript.find("if ") != std::string::npos) ||
-					   (m_optScript.find("if;") != std::string::npos) ||
-					   (m_optScript.find("if -") != std::string::npos);
-
+		// 合并分派依据实际子网结果类型, 与 -S 值/路径无关
 		vector<Abc_Ntk_t *> &targetNtks = m_vSubNtksOptimized;
 
 		if (targetNtks.empty())
 			return;
+
+		// 实际子网形式决定合并函数: 全部 STRASH 走 AIG 合并;
+		// 含 logic(映射/SOP) 子网走 mapped 合并 (mapped 合并能处理
+		// Mio 与 SOP 子网, 且锚点指向子网对象, 不能在合并前释放/替换)。
+		// 混合类型仅可能出现在映射意图的回退子网, 默认策略用 mapped 合并,
+		// strict 模式失败。
+		bool fAnyLogic = false, fAnyStrash = false;
+		for (auto pNtk : targetNtks)
+		{
+			if (!pNtk)
+				continue;
+			if (Abc_NtkIsStrash(pNtk))
+				fAnyStrash = true;
+			else
+				fAnyLogic = true;
+		}
+		if (fAnyLogic && fAnyStrash && m_fStrict)
+		{
+			ylog("[PIF-STRICT] mixed mapped/AIG child results; failing pif per -e.\n");
+			m_nChildFailure++;
+			m_fPipelineFailed = true;
+			return;
+		}
+		if (fAnyLogic && fAnyStrash)
+			ylog("[Warn] mixed mapped/AIG child results; using mapped merge.\n");
+		bool isMapped = fAnyLogic;
 
 		ylog("Merging %s subnetworks (Structure-based)...\n", isMapped ? "mapped" : "optimized");
 
@@ -1255,10 +1331,11 @@ namespace ymc
 
 		// === 写文件 ===
 		char filename[256];
-		if (isMapped)
+		// 写形式跟随合并后网络的实际类型: STRASH -> AIG 文件, logic -> 映射文件
+		bool isMappedOut = Abc_NtkIsLogic(pMergedNtk);
+		if (isMappedOut)
 		{
-			bool isAsic = (m_mapType == "asic") ||
-						  (m_mapType.empty() && m_optScript.find("map") != std::string::npos);
+			bool isAsic = (m_mapType == "asic");
 
 			if (isAsic)
 			{
