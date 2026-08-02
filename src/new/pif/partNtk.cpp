@@ -47,6 +47,24 @@ namespace ymc
 
 	void PartNtk::init()
 	{
+		// Yosys passes the per-subnetwork ABC command sequence through a script
+		// file because semicolons cannot be embedded safely in its ABC argument
+		// encoding. Accept both the documented inline form and a readable file.
+		if (!m_optScript.empty() && access(m_optScript.c_str(), R_OK) == 0)
+		{
+			FILE *scriptFile = fopen(m_optScript.c_str(), "r");
+			if (scriptFile)
+			{
+				std::string scriptText;
+				char buffer[1024];
+				while (fgets(buffer, sizeof(buffer), scriptFile))
+					scriptText += buffer;
+				fclose(scriptFile);
+				if (!scriptText.empty())
+					m_optScript = scriptText;
+			}
+		}
+
 		// === 推断 abc 可执行文件路径 ===
 		if (const char *env = getenv("PIF_ABC_BIN"))
 			m_abcBin = env;
@@ -65,40 +83,49 @@ namespace ymc
 			}
 		}
 
-		// === 推断 abc.rc 路径 ===
+		// === 推断可选的 abc.rc 路径 ===
+		// 所有 PIF 子进程命令都使用完整命令名，不应因为缺少 abc.rc 而失败。
+		// 源码树构建还需要检查 <bin>/abc/abc.rc，因为 yosys-abc 位于仓库根目录。
+		m_abcRc.clear();
 		if (const char *env = getenv("PIF_ABC_RC"))
-			m_abcRc = env;
+		{
+			if (access(env, R_OK) == 0)
+				m_abcRc = env;
+			else
+				ylog("[Warn] PIF_ABC_RC is not readable, continuing without it: %s\n", env);
+		}
 		else
 		{
-			// abc.rc 通常在可执行文件同目录或上级目录
 			char binCopy[PATH_MAX];
 			strncpy(binCopy, m_abcBin.c_str(), sizeof(binCopy) - 1);
 			binCopy[sizeof(binCopy) - 1] = '\0';
 			std::string binDir = dirname(binCopy);
 
-			// 优先检查同目录
-			std::string rcCandidate = binDir + "/abc.rc";
-			if (access(rcCandidate.c_str(), R_OK) == 0)
-				m_abcRc = rcCandidate;
-			else
-			{
-				// 尝试上级目录
-				strncpy(binCopy, binDir.c_str(), sizeof(binCopy) - 1);
-				rcCandidate = std::string(dirname(binCopy)) + "/abc.rc";
-				if (access(rcCandidate.c_str(), R_OK) == 0)
-					m_abcRc = rcCandidate;
-				else
-					m_abcRc = "abc.rc"; // fallback
-			}
+			strncpy(binCopy, binDir.c_str(), sizeof(binCopy) - 1);
+			binCopy[sizeof(binCopy) - 1] = '\0';
+			std::string parentDir = dirname(binCopy);
+
+			const std::string candidates[] = {
+				binDir + "/abc.rc",
+				binDir + "/abc/abc.rc",
+				parentDir + "/abc.rc"
+			};
+			for (const auto &candidate : candidates)
+				if (access(candidate.c_str(), R_OK) == 0)
+				{
+					m_abcRc = candidate;
+					break;
+				}
 		}
 
 		// === 默认优化脚本 ===
 		if (m_optScript.empty())
 		{
+			const char *resyn2 = "balance; rewrite; refactor; balance; rewrite; rewrite -z; balance; refactor -z; rewrite -z; balance";
 			if (m_mapType == "asic")
-				m_optScript = "strash; dc2; fraig; resyn2; map";
+				m_optScript = std::string("strash; dc2; fraig; ") + resyn2 + "; map";
 			else
-				m_optScript = "strash; dc2; fraig; resyn2; if -K 6 -C 8";
+				m_optScript = std::string("strash; dc2; fraig; ") + resyn2 + "; if -K 6 -C 8";
 		}
 
 		// === ASIC 映射校验 ===
@@ -118,7 +145,11 @@ namespace ymc
 		}
 
 		ylog("ABC binary: %s\n", m_abcBin.c_str());
-		ylog("ABC RC:     %s\n", m_abcRc.c_str());
+		ylog("ABC RC:     %s\n", m_abcRc.empty() ? "(not found; aliases disabled)" : m_abcRc.c_str());
+		// The existing child command builder always emits a source command.
+		// /dev/null is a valid empty source file and keeps that command well-formed.
+		if (m_abcRc.empty())
+			m_abcRc = "/dev/null";
 		ylog("Opt script: %s\n", m_optScript.c_str());
 		ylog("Map type:   %s\n", m_mapType.c_str());
 		if (!m_libPath.empty())
@@ -143,6 +174,11 @@ namespace ymc
 		optimizeSubNtks();
 
 		// Phase 3: Align & Merge
+		if (!normalizeOptimizedNetworks())
+		{
+			ylog("[Error] Failed to normalize optimized sub-networks, skipping Output.\n");
+			return;
+		}
 		alignInterfaces();
 
 		if (!m_vSubNtksOptimized.empty())
@@ -984,6 +1020,42 @@ namespace ymc
 
 		auto end_total = Clock::now();
 		m_stats.timeOptTotal = std::chrono::duration<double>(end_total - start_total).count();
+	}
+
+	bool PartNtk::normalizeOptimizedNetworks()
+	{
+		// Abc_NtkMerge recursively traverses AIG nodes. Child-process failures and
+		// BLIF fallbacks can leave a non-mapped result in logic/SOP form, so make
+		// the merge contract explicit before interface pointers are attached.
+		bool isMapped = false;
+		if (m_mapType == "fpga" || m_mapType == "asic")
+			isMapped = true;
+		else if (m_mapType.empty())
+			isMapped = (m_optScript.find("map") != std::string::npos) ||
+					   (m_optScript.find("if ") != std::string::npos) ||
+					   (m_optScript.find("if;") != std::string::npos) ||
+					   (m_optScript.find("if -") != std::string::npos);
+
+		if (isMapped)
+			return true;
+
+		for (size_t i = 0; i < m_vSubNtksOptimized.size(); i++)
+		{
+			Abc_Ntk_t *pNtk = m_vSubNtksOptimized[i];
+			if (!pNtk || Abc_NtkIsStrash(pNtk))
+				continue;
+
+			Abc_Ntk_t *pStrash = Abc_NtkStrash(pNtk, 0, 1, 0);
+			if (!pStrash)
+			{
+				ylog("[Error] Could not convert optimized sub-network %zu to AIG form.\n", i);
+				return false;
+			}
+
+			Abc_NtkDelete(pNtk);
+			m_vSubNtksOptimized[i] = pStrash;
+		}
+		return true;
 	}
 
 	void PartNtk::alignInterfaces()

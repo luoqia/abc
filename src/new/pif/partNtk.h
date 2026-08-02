@@ -1,7 +1,6 @@
 #pragma once
 
 #include "yaig.h"
-#include "omp.h"
 #include "base/io/ioAbc.h"
 #include <chrono>
 #include <numeric>
@@ -65,6 +64,7 @@ namespace ymc
 		void partOriginNtk();
 		void tagSubNtkPorts();
 		void optimizeSubNtks();
+		bool normalizeOptimizedNetworks();
 		void alignInterfaces();
 		void mergeAndOutput();
 
