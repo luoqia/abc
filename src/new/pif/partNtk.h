@@ -7,6 +7,7 @@
 #include <numeric>
 #include "base/abc/abc.h"
 #include <sys/time.h>
+#include <linux/limits.h> // PATH_MAX
 
 #include "new/pif/partNtkFuncs.h"
 
@@ -45,7 +46,7 @@ namespace ymc
 			: m_nParts(nParts), m_pOriginNtk(pNtkOrigin), m_sCluster(sCluster),
 			  m_nMaxConcurrent(nMaxConcurrent), m_fStrict(fStrict)
 		{
-			strcpy(m_dirName, dirName);
+			snprintf(m_dirName, sizeof(m_dirName), "%s", dirName);
 			if (optScript && strlen(optScript) > 0)
 				m_optScript = optScript;
 			m_mapType = (mapType && strlen(mapType) > 0) ? mapType : "";
@@ -85,7 +86,7 @@ namespace ymc
 		Abc_Ntk_t *m_pMappedNtk;
 		vector<Abc_Ntk_t *> m_vSubNtks;
 		vector<Abc_Ntk_t *> m_vSubNtksMapped; // 保留但不再主动使用，后续可删
-		char m_dirName[100];
+		char m_dirName[PATH_MAX];
 		uint32_t m_sCluster;
 		vector<Abc_Ntk_t *> m_vSubNtksOptimized;
 
