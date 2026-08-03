@@ -1231,7 +1231,20 @@ namespace ymc
 			return;
 		}
 		if (fAnyLogic && fAnyStrash)
-			ylog("[Warn] mixed mapped/AIG child results; using mapped merge.\n");
+		{
+			// 混合子网: mapped 合并无法安全处理 strash 子网 (节点 pData 为 NULL,
+			// Abc_NtkDupObj 的 Hop_Transfer 会解引用无效指针)。
+			// 默认策略: 全部转为 STRASH 走 AIG 合并 (函数保持, v3c 下游有 strash)。
+			// 转换替换了锚点指向的子网对象, 必须重新对齐接口。
+			ylog("[Warn] mixed mapped/AIG child results; converting all children to AIG for merge.\n");
+			for (auto &pNtk : targetNtks)
+			{
+				if (pNtk && !Abc_NtkIsStrash(pNtk))
+					pNtk = ToAigForm(pNtk);
+			}
+			alignInterfaces();
+			fAnyLogic = false;
+		}
 		bool isMapped = fAnyLogic;
 
 		ylog("Merging %s subnetworks (Structure-based)...\n", isMapped ? "mapped" : "optimized");
