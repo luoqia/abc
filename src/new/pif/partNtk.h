@@ -1,7 +1,6 @@
 #pragma once
 
 #include "yaig.h"
-#include "omp.h"
 #include "base/io/ioAbc.h"
 #include <chrono>
 #include <numeric>

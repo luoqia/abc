@@ -5,7 +5,6 @@
 #include <memory>
 
 #include "partNtk.h"
-#include "omp.h"
 
 using namespace std;
 
