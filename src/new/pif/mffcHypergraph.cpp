@@ -499,6 +499,12 @@ namespace ymc
 					v.id = in.v[i].id;
 					v.weight = in.v[i].weight;
 					v.part = -1;
+					// Self-child: an unmatched vertex persists to the next
+					// level, and the uncoarsening projection must still
+					// assign the part of its finer-level copy. Without this,
+					// every singleton-chain vertex keeps part -1 and falls
+					// to the "else" side of the final split.
+					v.children = {i};
 					out.v.push_back(v);
 				}
 				else if (i < match[i])
@@ -639,6 +645,8 @@ namespace ymc
 				int64_t newA = (l.v[v].part == 0) ? wA - dw : wA + dw;
 				if (std::llabs(newA - targetW1) > slack)
 					continue; // constrained: skip without locking
+				if (newA < 0 || newA > wA + wB)
+					continue; // never allow a negative or over-full side
 				// apply the move
 				int32_t from = l.v[v].part;
 				l.v[v].part = 1 - from;
@@ -764,17 +772,18 @@ namespace ymc
 			// initial bisection on the coarsest level
 			hgInitialBisect(levels.back());
 
-			// uncoarsen: project parts down, then constrained FM refinement
+			// uncoarsen: project parts down, then constrained FM refinement.
+			// The balance slack is fixed from the finest (original unit)
+			// level: a coarsened vertex can exceed it (indivisible-unit
+			// exception), but the FM must never move a vertex across the
+			// cut when that would violate the finest-level bound, otherwise
+			// a giant coarsened vertex silently unbalances the whole split.
+			int64_t slack = std::max<int64_t>(targetW1 / 20, maxW);
 			for (int li = (int)levels.size() - 2; li >= 0; li--)
 			{
 				for (const auto &v : levels[li + 1].v)
 					for (int32_t c : v.children)
 						levels[li].v[c].part = v.part;
-				int64_t maxWl = 0;
-				for (const auto &v : levels[li].v)
-					if (v.weight > maxWl)
-						maxWl = v.weight;
-				int64_t slack = std::max<int64_t>(targetW1 / 20, maxWl);
 				hgFmRefine(levels[li], targetW1, slack);
 			}
 
@@ -790,26 +799,29 @@ namespace ymc
 			// Exact-K feasibility: each side needs at least its target part
 			// count of units. Repair sizes deterministically by moving the
 			// smallest units (weight, then id) from the over-large side.
+			// Move the smallest units first so count repair disturbs the
+			// weight balance as little as possible.
 			auto sizeRepair = [&](std::vector<int32_t> &x, int32_t needX,
 								  std::vector<int32_t> &y, int32_t needY)
 			{
 				if ((int32_t)x.size() >= needX && (int32_t)y.size() >= needY)
 					return;
-				std::sort(x.begin(), x.end(), [&](int32_t u1, int32_t u2)
-						  { return m_units[u1].nNodes < m_units[u2].nNodes ||
-								   (m_units[u1].nNodes == m_units[u2].nNodes && u1 < u2); });
-				std::sort(y.begin(), y.end(), [&](int32_t u1, int32_t u2)
-						  { return m_units[u1].nNodes < m_units[u2].nNodes ||
-								   (m_units[u1].nNodes == m_units[u2].nNodes && u1 < u2); });
+				auto byWeight = [&](int32_t u1, int32_t u2)
+				{
+					return m_units[u1].nNodes < m_units[u2].nNodes ||
+						   (m_units[u1].nNodes == m_units[u2].nNodes && u1 < u2);
+				};
 				while ((int32_t)x.size() < needX && !y.empty())
 				{
-					x.push_back(y.back());
-					y.pop_back();
+					std::sort(y.begin(), y.end(), byWeight);
+					x.push_back(y.front());
+					y.erase(y.begin());
 				}
 				while ((int32_t)y.size() < needY && !x.empty())
 				{
-					y.push_back(x.back());
-					x.pop_back();
+					std::sort(x.begin(), x.end(), byWeight);
+					y.push_back(x.front());
+					x.erase(x.begin());
 				}
 				// the moved units keep the weight/connectivity they had; an
 				// oversized indivisible unit on a side is the explicit
