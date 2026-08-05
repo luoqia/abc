@@ -412,6 +412,21 @@ namespace ymc
 		int nCutEdgeFromPi = 0;
 		int nCutEdge = 0;
 
+		// Task 17 Stage 2 ground truth: per signal, the producer/owner part
+		// and the deduped set of consumer parts that actually received an
+		// interface PI/PO in the emitted child networks. Read only by the
+		// telemetry hook below; never affects selection.
+		std::map<int32_t, std::pair<int32_t, std::set<int32_t>>> signalCuts;
+		auto recordCut = [&](int32_t signalNodeId, int32_t consumerPart)
+		{
+			if (!pifTelemetryDir())
+				return;
+			auto &rec = signalCuts[signalNodeId];
+			if (rec.second.empty())
+				rec.first = m_vPartition[signalNodeId];
+			rec.second.insert(consumerPart);
+		};
+
 		for (i = 0; i < vSubNtks.size(); i++)
 		{
 			vSubNtks[i] = initOneSubNtk(i);
@@ -442,6 +457,7 @@ namespace ymc
 			if (ipart0 != ipart) // cut edge found!
 			{
 				nCutEdge++;
+				recordCut(iFanin0, ipart);
 				if (Abc_ObjIsPi(pFanin0)) // when the Ci has a fanout edge that is cut, don't generate cut-caused PO
 				{
 					nCutEdgeFromPi++;
@@ -518,6 +534,7 @@ namespace ymc
 				if (ipart1 != ipart)
 				{
 					nCutEdge++;
+					recordCut(iFanin1, ipart);
 					if (Abc_ObjIsPi(pFanin1)) // when the Ci has a fanout edge that is cut, don't generate cut-caused PO
 					{
 						nCutEdgeFromPi++;
@@ -584,6 +601,37 @@ namespace ymc
 
 		ylog("Total number of CIs with cut fanout edges: %d\n", nCutEdgeFromPi);
 		ylog("Total number of cut edges: %d\n", nCutEdge);
+
+		// Task 17 Stage 2: emit the node-level interface ground truth.
+		if (pifTelemetryDir())
+		{
+			char buf[512];
+			for (const auto &kv : signalCuts)
+			{
+				int32_t sig = kv.first;
+				const char *type = "const";
+				if (sig >= 0 && sig < (int32_t)m_vpObjs.size() && m_vpObjs[sig])
+				{
+					if (Abc_ObjIsNode(m_vpObjs[sig]))
+						type = "internal";
+					else if (Abc_ObjIsPi(m_vpObjs[sig]))
+						type = "pi";
+				}
+				std::string parts;
+				for (int32_t p : kv.second.second)
+				{
+					if (!parts.empty())
+						parts += ",";
+					parts += std::to_string(p);
+				}
+				snprintf(buf, sizeof(buf), "%d\t%s\t%d\t%s\t%zu",
+						 sig, type, (int)kv.second.first,
+						 parts.c_str(), kv.second.second.size());
+				pifTelemetryRow("pif_signal_cut.tsv",
+								"signalNodeId\ttype\tproducerPart\tconsumerParts\tnConsumerParts",
+								buf);
+			}
+		}
 
 		return 0;
 	}
