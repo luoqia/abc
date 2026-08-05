@@ -342,7 +342,8 @@ namespace ymc
 			}
 		}
 		{
-			char buf[1024];
+			// Rows are built in a std::string: a high-fanout edge can have
+			// tens of thousands of pins and must never be truncated.
 			for (const auto &e : m_edges)
 			{
 				std::string pins;
@@ -352,13 +353,21 @@ namespace ymc
 						pins += ",";
 					pins += std::to_string(e.pins[k]);
 				}
-				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%d\t%d\t%s\t%d\t%lld\t%d",
-						 e.edgeId, e.type, e.signalNodeId, (int)e.producerUnit,
-						 (int)e.fanout, (int)e.weight, pins.c_str(),
-						 e.singleton ? 1 : 0, (long long)e.lambda, (int)e.cutNet);
+				std::string row;
+				row.reserve(pins.size() + 64);
+				row += std::to_string(e.edgeId);
+				row += "\t" + std::to_string(e.type);
+				row += "\t" + std::to_string(e.signalNodeId);
+				row += "\t" + std::to_string((int)e.producerUnit);
+				row += "\t" + std::to_string((int)e.fanout);
+				row += "\t" + std::to_string((int)e.weight);
+				row += "\t" + pins;
+				row += "\t" + std::to_string(e.singleton ? 1 : 0);
+				row += "\t" + std::to_string((long long)e.lambda);
+				row += "\t" + std::to_string((int)e.cutNet);
 				pifTelemetryRow("pif_hg_edge.tsv",
 								"edgeId\ttype\tsignalNodeId\tproducerUnit\tfanout\tweight\tpins\tsingleton\tlambda\tcutNet",
-								buf);
+								row.c_str());
 			}
 		}
 		{
@@ -420,6 +429,14 @@ namespace ymc
 		{
 			std::vector<HgVtx> v;
 			std::vector<HgEdge> e;
+			std::vector<std::vector<int32_t>> inc; // vertex -> incident edge indices
+			void buildIncidence()
+			{
+				inc.assign(v.size(), {});
+				for (size_t ei = 0; ei < e.size(); ei++)
+					for (int32_t p : e[ei].pins)
+						inc[p].push_back((int32_t)ei);
+			}
 		};
 
 		int64_t levelWeight(const HgLevel &l, int32_t side)
@@ -438,25 +455,20 @@ namespace ymc
 			const int32_t n = (int32_t)in.v.size();
 			std::vector<int32_t> match(n, -1);
 			std::vector<bool> matched(n, false);
+			// Incidence list makes the shared-connectivity scan O(pins)
+			// per level instead of O(|V| * |E| * avgPins).
 			for (int32_t i = 0; i < n; i++)
 			{
 				if (matched[i])
 					continue;
 				// shared connectivity of (i, neighbor) = total weight of
-				// hyperedges containing both; iterate edges in order and
-				// accumulate into a sorted map so the result is stable.
+				// hyperedges containing both; iterate incident edges in
+				// ascending edge order and accumulate into a sorted map so
+				// the result is stable.
 				std::map<int32_t, int64_t> conn;
-				for (const auto &e : in.e)
+				for (int32_t ei : in.inc[i])
 				{
-					bool hasI = false;
-					for (int32_t p : e.pins)
-						if (p == i)
-						{
-							hasI = true;
-							break;
-						}
-					if (!hasI)
-						continue;
+					const HgEdge &e = in.e[ei];
 					for (int32_t p : e.pins)
 						if (p != i && !matched[p])
 							conn[p] += e.weight;
@@ -571,18 +583,9 @@ namespace ymc
 			auto gainOf = [&](int32_t vid) -> int64_t
 			{
 				int64_t g = 0;
-				for (size_t ei = 0; ei < l.e.size(); ei++)
+				for (int32_t ei : l.inc[vid])
 				{
 					const auto &e = l.e[ei];
-					bool hasV = false;
-					for (int32_t p : e.pins)
-						if (p == vid)
-						{
-							hasV = true;
-							break;
-						}
-					if (!hasV)
-						continue;
 					bool sole = (l.v[vid].part == 0) ? (pinsA[ei] == 1) : (pinsB[ei] == 1);
 					bool other = (l.v[vid].part == 0) ? (pinsB[ei] >= 1) : (pinsA[ei] >= 1);
 					if (sole && other)
@@ -649,18 +652,9 @@ namespace ymc
 					wB -= dw;
 					wA += dw;
 				}
-				for (size_t ei = 0; ei < l.e.size(); ei++)
+				for (int32_t ei : l.inc[v])
 				{
 					const auto &e = l.e[ei];
-					bool hasV = false;
-					for (int32_t p : e.pins)
-						if (p == v)
-						{
-							hasV = true;
-							break;
-						}
-					if (!hasV)
-						continue;
 					if (from == 0)
 					{
 						pinsA[ei]--;
@@ -755,6 +749,7 @@ namespace ymc
 
 			// coarsen (cap keeps any coarsened vertex bisectable)
 			std::vector<HgLevel> levels;
+			l0.buildIncidence();
 			levels.push_back(l0);
 			int64_t capW = targetW1 + std::max<int64_t>(targetW1 / 20, maxW);
 			while (levels.back().v.size() > 1)
@@ -762,6 +757,7 @@ namespace ymc
 				HgLevel nl;
 				if (!hgCoarsen(levels.back(), nl, capW))
 					break;
+				nl.buildIncidence();
 				levels.push_back(nl);
 			}
 
