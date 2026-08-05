@@ -697,8 +697,14 @@ namespace ymc
 			K = nUnits;
 
 		// Recursive bisection with proportional capacity targets.
-		std::function<void(const std::vector<int32_t> &, int32_t, int32_t)> bisectRec;
-		bisectRec = [&](const std::vector<int32_t> &subset, int32_t k, int32_t basePart)
+		// The recursion carries the induced edge list of the current
+		// subset; each level filters only its parent's edges instead of
+		// rescanning the whole hypergraph (O(edges) per bisection would be
+		// quadratic over the recursion tree).
+		std::function<void(const std::vector<int32_t> &, const std::vector<std::vector<int32_t>> &, int32_t, int32_t)> bisectRec;
+		bisectRec = [&](const std::vector<int32_t> &subset,
+						const std::vector<std::vector<int32_t>> &subsetEdges,
+						int32_t k, int32_t basePart)
 		{
 			if (k > (int32_t)subset.size())
 				k = (int32_t)subset.size(); // exact-K feasibility: k <= |subset|
@@ -733,10 +739,11 @@ namespace ymc
 					v.part = -1;
 					l0.v.push_back(v);
 				}
-				for (const auto &e : m_edges)
+				for (const auto &pins0 : subsetEdges)
 				{
 					std::vector<int32_t> pins;
-					for (int32_t p : e.pins)
+					pins.reserve(pins0.size());
+					for (int32_t p : pins0)
 					{
 						auto it = u2idx.find(p);
 						if (it != u2idx.end())
@@ -747,9 +754,9 @@ namespace ymc
 					if (pins.size() >= 2)
 					{
 						HgEdge ne;
-						ne.id = e.edgeId;
+						ne.id = (int32_t)l0.e.size();
 						ne.pins = pins;
-						ne.weight = e.weight;
+						ne.weight = 1;
 						l0.e.push_back(ne);
 					}
 				}
@@ -800,7 +807,9 @@ namespace ymc
 			// count of units. Repair sizes deterministically by moving the
 			// smallest units (weight, then id) from the over-large side.
 			// Move the smallest units first so count repair disturbs the
-			// weight balance as little as possible.
+			// weight balance as little as possible. One sort per repair:
+			// sorting inside the move loop is O(n^2 log n) and took minutes
+			// on the XS1c-scale hypergraph.
 			auto sizeRepair = [&](std::vector<int32_t> &x, int32_t needX,
 								  std::vector<int32_t> &y, int32_t needY)
 			{
@@ -811,17 +820,19 @@ namespace ymc
 					return m_units[u1].nNodes < m_units[u2].nNodes ||
 						   (m_units[u1].nNodes == m_units[u2].nNodes && u1 < u2);
 				};
-				while ((int32_t)x.size() < needX && !y.empty())
+				if ((int32_t)x.size() < needX && !y.empty())
 				{
 					std::sort(y.begin(), y.end(), byWeight);
-					x.push_back(y.front());
-					y.erase(y.begin());
+					size_t take = std::min<size_t>(needX - x.size(), y.size());
+					x.insert(x.end(), y.begin(), y.begin() + take);
+					y.erase(y.begin(), y.begin() + take);
 				}
-				while ((int32_t)y.size() < needY && !x.empty())
+				if ((int32_t)y.size() < needY && !x.empty())
 				{
 					std::sort(x.begin(), x.end(), byWeight);
-					y.push_back(x.front());
-					x.erase(x.begin());
+					size_t take = std::min<size_t>(needY - y.size(), x.size());
+					y.insert(y.end(), x.begin(), x.begin() + take);
+					x.erase(x.begin(), x.begin() + take);
 				}
 				// the moved units keep the weight/connectivity they had; an
 				// oversized indivisible unit on a side is the explicit
@@ -835,13 +846,38 @@ namespace ymc
 					unit2part[u] = basePart;
 				return;
 			}
-			bisectRec(a, k1, basePart);
-			bisectRec(b, k2, basePart + k1);
+			// partition the parent's induced edges into the children's
+			// induced edge lists (each edge keeps its unit-id pins)
+			std::vector<std::vector<int32_t>> aEdges, bEdges;
+			{
+				std::vector<char> inA(nUnits, 0);
+				for (int32_t u : a)
+					inA[u] = 1;
+				for (const auto &pins0 : subsetEdges)
+				{
+					std::vector<int32_t> pa, pb;
+					for (int32_t p : pins0)
+						if (inA[p])
+							pa.push_back(p);
+						else
+							pb.push_back(p);
+					if (pa.size() >= 2)
+						aEdges.push_back(std::move(pa));
+					if (pb.size() >= 2)
+						bEdges.push_back(std::move(pb));
+				}
+			}
+			bisectRec(a, aEdges, k1, basePart);
+			bisectRec(b, bEdges, k2, basePart + k1);
 		};
 
 		std::vector<int32_t> all(nUnits);
 		std::iota(all.begin(), all.end(), 0);
-		bisectRec(all, K, 0);
+		std::vector<std::vector<int32_t>> allEdges;
+		allEdges.reserve(m_edges.size());
+		for (const auto &e : m_edges)
+			allEdges.push_back(e.pins);
+		bisectRec(all, allEdges, K, 0);
 		return unit2part;
 	}
 
