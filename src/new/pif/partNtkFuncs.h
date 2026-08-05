@@ -164,6 +164,7 @@ namespace ymc
         MetisAig() : m_pMG(NULL) {};
         ~MetisAig() = default;
         void bindGraph(MetisGraph *pmg);
+        const std::vector<int64_t> &getPartitionWorkloads() const { return m_vPartitionWorkload; }
 
         void parseAig(int32_t userK = 0);
         void parseAigMffc(int32_t userK = 0); // MFFC-based partition entry
@@ -221,6 +222,11 @@ namespace ymc
         int64_t m_iTotalWorkLoad;
         int64_t m_iMaxClusterWorkLoad;
 
+        // Task 16 Stage 3 telemetry: per-partition predicted workload in
+        // graph partition order (filled by partitionAigMffc/partitionAig;
+        // read only by telemetry, never by selection code).
+        std::vector<int64_t> m_vPartitionWorkload;
+
         vector<int> m_vConeId2ClusterId;
 
         // ============================================================
@@ -245,7 +251,8 @@ namespace ymc
         void runMffcClusteringAlgorithm(const PartitionConfig &config, const vector<int32_t> &mffcWorkloads);
         int findBestClusterForMffc(int mffcIdx, const PartitionConfig &config,
                                    const vector<int> &mffcId2ClusterId,
-                                   const vector<int32_t> &mffcWorkloads);
+                                   const vector<int32_t> &mffcWorkloads,
+                                   double *pOutScore = nullptr);
         void assignOrphanMffc(int mffcIdx, vector<int> &mffcId2ClusterId,
                               const vector<int32_t> &mffcWorkloads);
         void postProcessMffcClusters();

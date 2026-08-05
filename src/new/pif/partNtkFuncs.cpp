@@ -3,9 +3,44 @@
 #include <climits>
 #include <unordered_map>
 #include <string>
+#include <cstdio>
+#include <sys/types.h>
 
 namespace ymc
 {
+	// Task 16 Stage 3 behavior-neutral telemetry.
+	// All writes are gated by the PIF_TELEMETRY_DIR env var; when unset no
+	// file is opened or written and no selection semantics change. Rows are
+	// appended to per-topic TSV files under that directory. All counts use
+	// 64-bit accumulation so large-circuit totals cannot overflow.
+	namespace
+	{
+		const char *pifTelemetryDir()
+		{
+			static const char *d = getenv("PIF_TELEMETRY_DIR");
+			return (d && *d) ? d : nullptr;
+		}
+		FILE *pifTelemetryFile(const char *name)
+		{
+			const char *d = pifTelemetryDir();
+			if (!d)
+				return nullptr;
+			static char path[PATH_MAX];
+			snprintf(path, sizeof(path), "%s/%s", d, name);
+			return fopen(path, "a");
+		}
+		void pifTelemetryRow(const char *name, const char *header, const char *row)
+		{
+			FILE *f = pifTelemetryFile(name);
+			if (!f)
+				return;
+			if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0)
+				fprintf(f, "%s\n", header);
+			fprintf(f, "%s\n", row);
+			fclose(f);
+		}
+	}
+
 	MetisGraph::MetisGraph(Abc_Ntk_t *pNtk, bool fMetis)
 	{
 		yassert(Abc_NtkIsStrash(pNtk) && Abc_NtkHasAig(pNtk));
@@ -3548,6 +3583,20 @@ namespace ymc
 		identifyMffcs();
 		computeMffcAdjacency();
 
+		// Telemetry: original (pre-coalescing) MFFC table.
+		{
+			char buf[256];
+			for (size_t i = 0; i < m_vMffcs.size(); i++)
+			{
+				const MffcUnit &m = m_vMffcs[i];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%zu",
+						 m.iId, m.iRootId, (int)m.nNodes, (int)m.iMaxLevel,
+						 m.sAdjacentMffcId.size());
+				pifTelemetryRow("pif_mffc_orig.tsv",
+								"mffcIdx\trootId\tnNodes\tiMaxLevel\tadjCount", buf);
+			}
+		}
+
 		// ============================================================
 		// Pre-merge: coalesce tiny MFFCs along fanin chains
 		//
@@ -3633,6 +3682,14 @@ namespace ymc
 
 			// Merge root into bestNeighbor
 			mergeTarget[root] = bestNeighbor;
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%d",
+						 root, bestNeighbor, (int)m_vMffcs[root].nNodes,
+						 (int)m_vMffcs[bestNeighbor].nNodes, bestSharedEdges);
+				pifTelemetryRow("pif_mffc_merge.tsv",
+								"mergedIdx\ttargetIdx\tmergedNodes\ttargetNodes\tsharedEdges", buf);
+			}
 
 			// Transfer nodes
 			for (auto nodeId : m_vMffcs[root].vNodeIds)
@@ -3845,6 +3902,22 @@ namespace ymc
 			m_iTotalWorkLoad += outMffcWorkloads[i];
 		}
 		ylog("[MFFC] Total workload: %lld\n", (long long)m_iTotalWorkLoad);
+
+		// Telemetry: coalesced (post-merge) MFFC table with the active
+		// workload estimate, i.e. exactly the clustering input.
+		{
+			char buf[256];
+			for (int32_t i = 0; i < n; i++)
+			{
+				const MffcUnit &m = m_vMffcs[i];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%d\t%zu",
+						 m.iId, (int)m.nNodes, (int)m.iMaxLevel,
+						 (int)outMffcWorkloads[i], (int)m.iWorkload,
+						 m.sAdjacentMffcId.size());
+				pifTelemetryRow("pif_mffc.tsv",
+								"mffcIdx\tnNodes\tiMaxLevel\tworkload\tiWorkload\tadjCount", buf);
+			}
+		}
 	}
 
 	int32_t MetisAig::computeAdaptiveMffcTargetK(const vector<int32_t> &mffcWorkloads)
@@ -3881,6 +3954,17 @@ namespace ymc
 			K = std::max(2, nM / 3);
 
 		ylog("[MFFC-K] k_wl=%d, k_bn=%d -> K=%d\n", k_wl, k_bn, K);
+		{
+			char buf[256];
+			snprintf(buf, sizeof(buf), "%lld\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d",
+					 (long long)m_iTotalWorkLoad, (int)mffcWorkloads.size(), k_wl, k_bn,
+					 (int)std::max(1, (int32_t)(totalN / 3000)), (int)nM, K,
+					 TARGET_PER_PART, MAX_P, MIN_P,
+					 (int)((int64_t)totalN / 3000), (nM > 4) ? (nM * 2) / 3 : -1);
+			pifTelemetryRow("pif_k.tsv",
+							"totalWL\tnMffc\tk_wl\tk_bn\tk_n\tnM\tK\tTARGET_PER_PART\tMAX_P\tMIN_P\tk_n2\tcap23",
+							buf);
+		}
 		return K;
 	}
 
@@ -3906,6 +3990,15 @@ namespace ymc
 
 		ylog("[MFFC] Config: K=%d, avgWL=%lld, limit=%lld\n",
 			 config.targetK, (long long)config.avgWorkload, (long long)config.workloadLimit);
+		{
+			char buf[256];
+			snprintf(buf, sizeof(buf), "%d\t%d\t%lld\t%lld\t%.4f\t%.4f\t%.4f\t%.4f\t%d",
+					 config.targetK, userK, (long long)config.avgWorkload,
+					 (long long)config.workloadLimit, cv, factor, mean, sd, n);
+			pifTelemetryRow("pif_config.tsv",
+							"targetK\tuserK\tavgWorkload\tworkloadLimit\tcv\tfactor\tmean\tsd\tnMffc",
+							buf);
+		}
 		return config;
 	}
 
@@ -3940,6 +4033,12 @@ namespace ymc
 							dist[nb2] = 2;
 				}
 			seeds++;
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d", idx, (int)mffcWorkloads[idx], dist[idx], seeds - 1);
+				pifTelemetryRow("pif_seed.tsv",
+								"mffcIdx\tworkload\tdist\tseedOrder", buf);
+			}
 		};
 
 		int best = 0;
@@ -3980,25 +4079,45 @@ namespace ymc
 		{
 			if (id2cl[idx] != -1)
 				continue;
-			int bc = findBestClusterForMffc(idx, config, id2cl, mffcWorkloads);
+			double score = 0.0;
+			int bc = findBestClusterForMffc(idx, config, id2cl, mffcWorkloads, &score);
 			if (bc != -1)
 			{
 				id2cl[idx] = bc;
 				m_vClusters[bc].vConeIds.push_back(idx);
 				m_vClusters[bc].iWorkload += mffcWorkloads[idx];
+				{
+					char buf[256];
+					snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%.4f\t0", idx,
+							 bc, (int)mffcWorkloads[idx], score);
+					pifTelemetryRow("pif_grow.tsv",
+									"mffcIdx\tclusterId\tworkload\tscore\torphan", buf);
+				}
 			}
 			else
+			{
 				assignOrphanMffc(idx, id2cl, mffcWorkloads);
+				{
+					char buf[256];
+					snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%.4f\t1", idx,
+							 id2cl[idx], (int)mffcWorkloads[idx], score);
+					pifTelemetryRow("pif_grow.tsv",
+									"mffcIdx\tclusterId\tworkload\tscore\torphan", buf);
+				}
+			}
 		}
 		m_vMffcId2ClusterId = id2cl;
 	}
 
 	int MetisAig::findBestClusterForMffc(int mIdx, const PartitionConfig &config,
-										 const vector<int> &id2cl, const vector<int32_t> &wls)
+										 const vector<int> &id2cl, const vector<int32_t> &wls,
+										 double *pOutScore)
 	{
 		int best = -1;
 		double maxS = -1e18;
 		int32_t mffcWL = wls[mIdx];
+		if (pOutScore)
+			*pOutScore = 0.0;
 
 		// Count total boundary edges of this MFFC (proxy for how many
 		// cut edges placing it in the wrong cluster would create)
@@ -4041,6 +4160,8 @@ namespace ymc
 				best = cl.iId;
 			}
 		}
+		if (pOutScore)
+			*pOutScore = (best >= 0) ? maxS : -1e18;
 		return best;
 	}
 
@@ -4142,6 +4263,13 @@ namespace ymc
 					}
 				if (bt < 0)
 					break;
+				{
+					char buf[256];
+					snprintf(buf, sizeof(buf), "%d\t%d\t%d", mi, bt,
+							 (int)m_vClusters[mi].iWorkload);
+					pifTelemetryRow("pif_cap.tsv",
+									"clusterId\ttargetId\tworkload", buf);
+				}
 				for (auto mid : m_vClusters[mi].vConeIds)
 					m_vClusters[bt].vConeIds.push_back(mid);
 				m_vClusters[bt].iWorkload += m_vClusters[mi].iWorkload;
@@ -4164,6 +4292,32 @@ namespace ymc
 
 		ylog("[MFFC] Final: %d partitions, totalWL=%lld\n", (int)m_vClusters.size(), (long long)m_iTotalWorkLoad);
 		printClusters();
+
+		// Telemetry: final cluster table (cluster id, predicted workload,
+		// node count, cone/MFFC count, max level) and the predicted
+		// critical cluster.
+		{
+			char buf[256];
+			int critIdx = -1;
+			int64_t critWl = -1;
+			for (int i = 0; i < (int)m_vClusters.size(); i++)
+			{
+				const Cluster &c = m_vClusters[i];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%zu\t%d",
+						 c.iId, (int)c.iWorkload, (int)c.nNodes,
+						 c.vConeIds.size(), (int)c.iMaxLevel);
+				pifTelemetryRow("pif_final.tsv",
+								"clusterId\tworkload\tnNodes\tnMffc\tiMaxLevel", buf);
+				if ((int64_t)c.iWorkload > critWl)
+				{
+					critWl = c.iWorkload;
+					critIdx = i;
+				}
+			}
+			snprintf(buf, sizeof(buf), "critical\t%d\t%lld", critIdx, (long long)critWl);
+			pifTelemetryRow("pif_final.tsv",
+							"clusterId\tworkload\tnNodes\tnMffc\tiMaxLevel", buf);
+		}
 	}
 
 	void MetisAig::rebalanceMffcClusters(vector<int32_t> &mffcWorkloads)
@@ -4238,6 +4392,13 @@ namespace ymc
 				m_vClusters[bt].vConeIds.push_back(mid);
 				m_vMffcId2ClusterId[mid] = bt;
 			}
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d", ci, bt, be,
+						 (int)m_vClusters[ci].iWorkload);
+				pifTelemetryRow("pif_rebalance.tsv",
+								"clusterId\ttargetId\tedges\tworkload", buf);
+			}
 			m_vClusters[bt].iWorkload += m_vClusters[ci].iWorkload;
 			m_vClusters[bt].nNodes += m_vClusters[ci].nNodes;
 			m_vClusters[ci].vConeIds.clear();
@@ -4268,6 +4429,15 @@ namespace ymc
 			if (m_vClusters[ci].nNodes <= thr || m_vClusters[ci].vConeIds.size() <= 1)
 				continue;
 			int nS = std::max(2, (int)((m_vClusters[ci].nNodes + thr - 1) / thr));
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%lld\t%d\t%lld\t%d\t%lld",
+						 ci, (long long)m_vClusters[ci].nNodes, (int)thr, nS,
+						 (long long)m_vClusters[ci].iWorkload,
+						 (long long)(m_vClusters[ci].iWorkload / std::max(nS, 1)));
+				pifTelemetryRow("pif_split.tsv",
+								"clusterId\tnNodes\tthr\tnSplits\tworkload\tperSplit", buf);
+			}
 
 			vector<pair<int, int32_t>> infos;
 			for (auto mid : m_vClusters[ci].vConeIds)
@@ -4360,6 +4530,32 @@ namespace ymc
 		for (int i = 0; i < (int)partitions.size(); i++)
 			for (auto cid : partitions[i].vClusterIds)
 				setGraphPartitionMffc(m_vClusters[cid], i);
+
+		// Telemetry: per-partition predicted workload in graph partition order.
+		m_vPartitionWorkload.clear();
+		m_vPartitionWorkload.reserve(partitions.size());
+		for (const auto &p : partitions)
+			m_vPartitionWorkload.push_back(p.iWorkload);
+		{
+			int critIdx = -1;
+			int64_t critWl = -1;
+			char buf[256];
+			for (int i = 0; i < (int)m_vPartitionWorkload.size(); i++)
+			{
+				snprintf(buf, sizeof(buf), "part\t%d\t%lld", i,
+						 (long long)m_vPartitionWorkload[i]);
+				pifTelemetryRow("pif_partition.tsv",
+								"kind\tpartitionIdx\tworkload", buf);
+				if (m_vPartitionWorkload[i] > critWl)
+				{
+					critWl = m_vPartitionWorkload[i];
+					critIdx = i;
+				}
+			}
+			snprintf(buf, sizeof(buf), "critical\t%d\t%lld", critIdx, (long long)critWl);
+			pifTelemetryRow("pif_partition.tsv",
+							"kind\tpartitionIdx\tworkload", buf);
+		}
 
 		// Safety net: assign all remaining unpartitioned non-PO nodes.
 		// MFFC only covers AND nodes; PI/Const nodes that are not

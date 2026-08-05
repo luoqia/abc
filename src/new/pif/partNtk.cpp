@@ -1,5 +1,6 @@
 #include "partNtk.h"
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <unordered_map>
@@ -13,6 +14,32 @@ using Clock = std::chrono::high_resolution_clock;
 
 namespace ymc
 {
+	// Task 16 Stage 3 behavior-neutral telemetry (child rows). Gated by
+	// PIF_TELEMETRY_DIR; no file is opened when the variable is unset.
+	namespace
+	{
+		const char *pifChildTelemetryDir()
+		{
+			static const char *d = getenv("PIF_TELEMETRY_DIR");
+			return (d && *d) ? d : nullptr;
+		}
+		void pifChildTelemetryRow(const char *name, const char *header, const char *row)
+		{
+			const char *d = pifChildTelemetryDir();
+			if (!d)
+				return;
+			static char path[PATH_MAX];
+			snprintf(path, sizeof(path), "%s/%s", d, name);
+			FILE *f = fopen(path, "a");
+			if (!f)
+				return;
+			if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0)
+				fprintf(f, "%s\n", header);
+			fprintf(f, "%s\n", row);
+			fclose(f);
+		}
+	}
+
 	// ---------------------------------------------------------------------------
 	// Path-independent result-type contract helpers.
 	// The merge path must never be chosen from the -S value (a file path in the
@@ -393,6 +420,11 @@ namespace ymc
 		init();
 		graph.createSubNtksFromPartition(m_vSubNtks);
 
+		// Telemetry: per-child predicted workload in child index order.
+		m_vSubNtkPredWorkload = aig.getPartitionWorkloads();
+		if (m_vSubNtkPredWorkload.size() != m_vSubNtks.size())
+			m_vSubNtkPredWorkload.assign(m_vSubNtks.size(), -1);
+
 		auto end = Clock::now();
 		m_stats.timePartition = std::chrono::duration<double>(end - start).count();
 	}
@@ -568,9 +600,10 @@ namespace ymc
 		int running_procs = 0;
 		pid_t my_pid = getpid();
 		std::unordered_map<pid_t, int> pid_to_idx;
+		std::unordered_map<pid_t, long> pid_to_parent_rss;
 		std::unordered_map<int, std::chrono::time_point<Clock>> task_start_times;
 
-		auto reap_process = [&](pid_t pid, int status)
+		auto reap_process = [&](pid_t pid, int status, const struct rusage &ru)
 		{
 			if (pid_to_idx.count(pid))
 			{
@@ -623,6 +656,34 @@ namespace ymc
 				m_dChildElapsedSum += dElapsed;
 				if (dElapsed > m_dChildElapsedMax)
 					m_dChildElapsedMax = dElapsed;
+
+				// Telemetry: per-child row (elapsed, CPU, RSS, outcome,
+				// before/after nodes and levels, predicted workload).
+				{
+					double cpuSec = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 +
+									(double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+					Abc_Ntk_t *pRes = m_vSubNtksOptimized[idx];
+					const char *resType = "failure";
+					if (pRes)
+						resType = Abc_NtkIsStrash(pRes) ? "aig" : "mapped";
+					if (pRes && !fChildOk)
+						resType = "fallback";
+					int64_t predWl = (idx < (int)m_vSubNtkPredWorkload.size()) ? m_vSubNtkPredWorkload[idx] : -1;
+					auto itRss = pid_to_parent_rss.find(pid);
+					long parentRssKB = (itRss != pid_to_parent_rss.end()) ? itRss->second : -1;
+					char buf[512];
+					snprintf(buf, sizeof(buf),
+							 "%d\t%lld\t%d\t%.6f\t%.6f\t%ld\t%ld\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%d",
+							 idx, (long long)predWl, nNodes, dElapsed, cpuSec,
+							 ru.ru_maxrss, parentRssKB, nExitStatus, nSignal, (int)fReadOk,
+							 (int)(!m_vSubNtksOptimized[idx]), resType,
+							 pRes ? Abc_NtkNodeNum(pRes) : 0,
+							 pRes ? Abc_NtkLevel(pRes) : 0,
+							 pRes ? Abc_NtkGetChoiceNum(pRes) : 0);
+					pifChildTelemetryRow("pif_child.tsv",
+										 "idx\tpredWorkload\tnNodesIn\telapsedS\tcpuS\trssKB\tparentRssKB\texit\tsig\tread\tfailed\tresultType\tnNodesOut\tlevOut\tchoicesOut",
+										 buf);
+				}
 
 				if (!m_vSubNtksOptimized[idx])
 				{
@@ -1134,10 +1195,11 @@ namespace ymc
 			while (running_procs >= max_concurrent)
 			{
 				int status;
-				pid_t pid = wait(&status);
+				struct rusage ru;
+				pid_t pid = wait4(-1, &status, 0, &ru);
 				if (pid > 0)
 				{
-					reap_process(pid, status);
+					reap_process(pid, status, ru);
 					running_procs--;
 				}
 			}
@@ -1178,6 +1240,8 @@ namespace ymc
 			if (dev_null != -1)
 				close(dev_null);
 
+			struct rusage rufork;
+			getrusage(RUSAGE_SELF, &rufork);
 			pid_t pid = fork();
 			if (pid == 0)
 			{
@@ -1208,6 +1272,7 @@ namespace ymc
 			else if (pid > 0)
 			{
 				pid_to_idx[pid] = i;
+				pid_to_parent_rss[pid] = rufork.ru_maxrss;
 				running_procs++;
 			}
 		}
@@ -1215,10 +1280,11 @@ namespace ymc
 		while (running_procs > 0)
 		{
 			int status;
-			pid_t pid = wait(&status);
+			struct rusage ru;
+			pid_t pid = wait4(-1, &status, 0, &ru);
 			if (pid > 0)
 			{
-				reap_process(pid, status);
+				reap_process(pid, status, ru);
 				running_procs--;
 			}
 		}

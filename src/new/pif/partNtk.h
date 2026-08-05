@@ -108,6 +108,11 @@ namespace ymc
 		double m_dChildElapsedSum = 0.0;
 		double m_dChildElapsedMax = 0.0;
 
+		// Task 16 Stage 3 telemetry: per-child predicted workload in child
+		// index order (copied from the partition graph; -1 when unavailable).
+		// Read only by telemetry, never by selection code.
+		std::vector<int64_t> m_vSubNtkPredWorkload;
+
 		PifTimeStats m_stats;
 	};
 
