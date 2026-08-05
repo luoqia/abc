@@ -4652,6 +4652,53 @@ namespace ymc
 			 m_hg.partCapacityCv());
 	}
 
+	void MetisAig::runHypergraphPartitioning(const PartitionConfig &config,
+											 const vector<int32_t> &mffcWorkloads)
+	{
+		// Deterministic internal multilevel partitioner over the
+		// post-preprocessing PartitionUnits. Target K comes from the same
+		// explicit-K or adaptive-K calculation as the control; exactly K
+		// non-empty parts are produced (K = min(targetK, nM)).
+		m_hg.build(m_vNodes, m_vNode2MffcId, m_vMffcs, m_vUnitOrigins, m_vUnitSplit);
+		int32_t K = std::min(config.targetK, (int32_t)m_vMffcs.size());
+		if (K < 1)
+			K = 1;
+		std::vector<int32_t> unit2part = m_hg.partitionMultiway(K);
+
+		// One cluster per part; every unit is assigned exactly once.
+		m_vClusters.clear();
+		m_vClusters.reserve(K);
+		for (int32_t p = 0; p < K; p++)
+			m_vClusters.emplace_back(p, 0);
+		for (size_t ui = 0; ui < m_vMffcs.size(); ui++)
+		{
+			int32_t p = (ui < unit2part.size()) ? unit2part[ui] : -1;
+			if (p < 0 || p >= K)
+				p = 0; // safety net: never lose or duplicate a unit
+			m_vClusters[p].vConeIds.push_back((int32_t)ui);
+			m_vClusters[p].iWorkload += mffcWorkloads[ui];
+			m_vClusters[p].nNodes += m_vMffcs[ui].nNodes;
+			if (m_vMffcs[ui].iMaxLevel > m_vClusters[p].iMaxLevel)
+				m_vClusters[p].iMaxLevel = m_vMffcs[ui].iMaxLevel;
+		}
+		m_vMffcId2ClusterId.assign(m_vMffcs.size(), -1);
+		for (int32_t p = 0; p < K; p++)
+			for (auto mid : m_vClusters[p].vConeIds)
+				m_vMffcId2ClusterId[mid] = p;
+
+		m_iTotalWorkLoad = 0;
+		m_iMaxClusterWorkLoad = 0;
+		for (auto &cl : m_vClusters)
+		{
+			m_iTotalWorkLoad += cl.iWorkload;
+			if (cl.iWorkload > m_iMaxClusterWorkLoad)
+				m_iMaxClusterWorkLoad = cl.iWorkload;
+		}
+		ylog("[MFFC] Final: %d partitions, totalWL=%lld\n",
+			 (int)m_vClusters.size(), (long long)m_iTotalWorkLoad);
+		printClusters();
+	}
+
 	void MetisAig::parseAigMffc(int32_t userK)
 	{
 		m_useMffc = true;
@@ -4659,8 +4706,7 @@ namespace ymc
 		vector<int32_t> mffcWorkloads;
 		preprocessMffcs(mffcWorkloads);
 		PartitionConfig config = determineMffcPartitionConfig(mffcWorkloads, userK);
-		runMffcClusteringAlgorithm(config, mffcWorkloads);
-		postProcessMffcClusters();
+		runHypergraphPartitioning(config, mffcWorkloads);
 	}
 
 } // for namespace

@@ -205,6 +205,10 @@ namespace ymc
         // Task 17 Stage 2: behavior-neutral PartitionUnit/hypergraph
         // telemetry over the control partition assignment.
         void buildHypergraphTelemetry();
+        // Task 17 Stage 4: deterministic internal multilevel hypergraph
+        // partitioner; replaces the pairwise-adjacency greedy clustering.
+        void runHypergraphPartitioning(const PartitionConfig &config,
+                                       const vector<int32_t> &mffcWorkloads);
 
         // --- Legacy Cone-based methods ---
         void visitAllFaninFromNode(int32_t nodeId, Cone &cone);

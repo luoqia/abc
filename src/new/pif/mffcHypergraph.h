@@ -77,6 +77,15 @@ namespace ymc
 		// the frozen-objective metrics over the control assignment.
 		void assignControl(const std::vector<int32_t> &unit2partition);
 
+		// Task 17 Stage 4: deterministic internal multilevel partitioner.
+		// Heavy-connectivity coarsening, balanced initial bisection,
+		// constrained FM-like refinement while uncoarsening, and recursive
+		// bisection to exactly K parts (K <= nUnits). Capacity targets are
+		// distributed proportionally over the recursion. All tie-breaks use
+		// stable ascending unit ids; there is no random start.
+		// Returns unit -> part id in [0, K).
+		std::vector<int32_t> partitionMultiway(int32_t K);
+
 		int64_t nUnits() const { return (int64_t)m_units.size(); }
 		int64_t nEdges() const { return (int64_t)m_edges.size(); }
 		int64_t nPinsTotal() const { return m_nPinsTotal; }
