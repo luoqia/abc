@@ -8,38 +8,6 @@
 
 namespace ymc
 {
-	// Task 16 Stage 3 behavior-neutral telemetry.
-	// All writes are gated by the PIF_TELEMETRY_DIR env var; when unset no
-	// file is opened or written and no selection semantics change. Rows are
-	// appended to per-topic TSV files under that directory. All counts use
-	// 64-bit accumulation so large-circuit totals cannot overflow.
-	namespace
-	{
-		const char *pifTelemetryDir()
-		{
-			static const char *d = getenv("PIF_TELEMETRY_DIR");
-			return (d && *d) ? d : nullptr;
-		}
-		FILE *pifTelemetryFile(const char *name)
-		{
-			const char *d = pifTelemetryDir();
-			if (!d)
-				return nullptr;
-			static char path[PATH_MAX];
-			snprintf(path, sizeof(path), "%s/%s", d, name);
-			return fopen(path, "a");
-		}
-		void pifTelemetryRow(const char *name, const char *header, const char *row)
-		{
-			FILE *f = pifTelemetryFile(name);
-			if (!f)
-				return;
-			if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0)
-				fprintf(f, "%s\n", header);
-			fprintf(f, "%s\n", row);
-			fclose(f);
-		}
-	}
 
 	MetisGraph::MetisGraph(Abc_Ntk_t *pNtk, bool fMetis)
 	{
@@ -3583,6 +3551,15 @@ namespace ymc
 		identifyMffcs();
 		computeMffcAdjacency();
 
+		// Task 17 Stage 2: track strict (pre-merge) MFFC origins through
+		// coalescing and splitting so every post-preprocessing unit can be
+		// labeled with its origin set and split-fragment flag. Telemetry
+		// state only; it never affects selection semantics.
+		m_vUnitOrigins.assign(m_vMffcs.size(), {});
+		m_vUnitSplit.assign(m_vMffcs.size(), false);
+		for (size_t i = 0; i < m_vMffcs.size(); i++)
+			m_vUnitOrigins[i].push_back((int32_t)i);
+
 		// Telemetry: original (pre-coalescing) MFFC table.
 		{
 			char buf[256];
@@ -3701,6 +3678,11 @@ namespace ymc
 			if (m_vMffcs[root].iMaxLevel > m_vMffcs[bestNeighbor].iMaxLevel)
 				m_vMffcs[bestNeighbor].iMaxLevel = m_vMffcs[root].iMaxLevel;
 
+			// Transfer strict-MFFC origins (telemetry state).
+			for (auto o : m_vUnitOrigins[root])
+				m_vUnitOrigins[bestNeighbor].push_back(o);
+			m_vUnitOrigins[root].clear();
+
 			// Transfer adjacency (merge neighbor sets)
 			for (auto adjId : m_vMffcs[root].sAdjacentMffcId)
 			{
@@ -3735,6 +3717,21 @@ namespace ymc
 				compacted.push_back(std::move(m_vMffcs[i]));
 			}
 			m_vMffcs = std::move(compacted);
+
+			// Remap strict-MFFC origins and split flags (telemetry state).
+			{
+				vector<vector<int32_t>> newOrigins(m_vMffcs.size());
+				vector<bool> newSplit(m_vMffcs.size(), false);
+				for (int i = 0; i < nMffcs; i++)
+				{
+					if (oldToNew[i] < 0)
+						continue;
+					newOrigins[oldToNew[i]] = std::move(m_vUnitOrigins[i]);
+					newSplit[oldToNew[i]] = m_vUnitSplit[i];
+				}
+				m_vUnitOrigins = std::move(newOrigins);
+				m_vUnitSplit = std::move(newSplit);
+			}
 
 			// Rebuild node->MFFC mapping
 			for (int32_t i = 0; i < (int32_t)m_vNode2MffcId.size(); i++)
@@ -3830,6 +3827,7 @@ namespace ymc
 			m_vMffcs[mi].vNodeIds = chunks[0];
 			m_vMffcs[mi].nNodes = (int32_t)chunks[0].size();
 			m_vMffcs[mi].iMaxLevel = 0;
+			m_vUnitSplit[mi] = true; // the split breaks the strict MFFC property
 			for (auto nid : chunks[0])
 			{
 				m_vNode2MffcId[nid] = mi;
@@ -3861,6 +3859,10 @@ namespace ymc
 					m_vNode2MffcId[nid] = newIdx;
 
 				m_vMffcs.push_back(std::move(newMffc));
+				// Fragments inherit the origins of the split unit and are
+				// labeled split fragments (telemetry state).
+				m_vUnitOrigins.push_back(m_vUnitOrigins[mi]);
+				m_vUnitSplit.push_back(true);
 			}
 
 			splitCount++;
@@ -4527,9 +4529,19 @@ namespace ymc
 				 { return a.iWorkload < b.iWorkload; });
 		}
 
+		m_vCluster2PartitionId.assign(m_vClusters.size(), -1);
 		for (int i = 0; i < (int)partitions.size(); i++)
 			for (auto cid : partitions[i].vClusterIds)
+			{
 				setGraphPartitionMffc(m_vClusters[cid], i);
+				if (cid >= 0 && cid < (int32_t)m_vCluster2PartitionId.size())
+					m_vCluster2PartitionId[cid] = i;
+			}
+
+		// Task 17 Stage 2: behavior-neutral PartitionUnit/hypergraph
+		// telemetry over the control assignment (gated by
+		// PIF_TELEMETRY_DIR; never affects selection).
+		buildHypergraphTelemetry();
 
 		// Telemetry: per-partition predicted workload in graph partition order.
 		m_vPartitionWorkload.clear();
@@ -4596,6 +4608,48 @@ namespace ymc
 				}
 			}
 		}
+	}
+
+	void MetisAig::buildHypergraphTelemetry()
+	{
+		if (!pifTelemetryDir())
+			return;
+
+		// unit -> partition from the control clustering.
+		std::vector<int32_t> unit2part(m_vMffcs.size(), -1);
+		for (size_t ui = 0; ui < m_vMffcs.size(); ui++)
+		{
+			int32_t cid = (ui < m_vMffcId2ClusterId.size()) ? m_vMffcId2ClusterId[ui] : -1;
+			if (cid >= 0 && cid < (int32_t)m_vCluster2PartitionId.size())
+				unit2part[ui] = m_vCluster2PartitionId[cid];
+		}
+
+		m_hg.build(m_vNodes, m_vNode2MffcId, m_vMffcs, m_vUnitOrigins, m_vUnitSplit);
+		m_hg.assignControl(unit2part);
+
+		// Strict (pre-merge) MFFC origins per post-preprocessing unit.
+		{
+			char buf[256];
+			for (size_t ui = 0; ui < m_vUnitOrigins.size(); ui++)
+				for (int32_t o : m_vUnitOrigins[ui])
+				{
+					snprintf(buf, sizeof(buf), "%zu\t%d", ui, (int)o);
+					pifTelemetryRow("pif_unit_origin.tsv",
+									"unitId\toriginMffcId", buf);
+				}
+		}
+		m_hg.exportTelemetry();
+
+		ylog("[MFFC-HG] %lld units, %lld edges (%lld internal, %lld PI, %lld PO, "
+			 "%lld const), %lld singleton, %lld cut nets, connectivity=%lld, "
+			 "crossPartPins=%lld, predInterfaces=%lld, partCapMax=%lld (CV %.3f)\n",
+			 (long long)m_hg.nUnits(), (long long)m_hg.nEdges(),
+			 (long long)m_hg.nInternalEdges(), (long long)m_hg.nPiEdges(),
+			 (long long)m_hg.nPoEdges(), (long long)m_hg.nConstEdges(),
+			 (long long)m_hg.nSingletonEdges(), (long long)m_hg.nCutNets(),
+			 (long long)m_hg.connectivityCost(), (long long)m_hg.crossPartitionPins(),
+			 (long long)m_hg.predictedInterfaces(), (long long)m_hg.partCapacityMax(),
+			 m_hg.partCapacityCv());
 	}
 
 	void MetisAig::parseAigMffc(int32_t userK)

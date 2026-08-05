@@ -420,6 +420,37 @@ namespace ymc
 		init();
 		graph.createSubNtksFromPartition(m_vSubNtks);
 
+		// Task 17 Stage 2: emitted child PI/PO/interface census
+		// (behavior-neutral telemetry; gated by PIF_TELEMETRY_DIR).
+		if (pifTelemetryDir())
+		{
+			Abc_Obj_t *pObj;
+			int k;
+			for (size_t ci = 0; ci < m_vSubNtks.size(); ci++)
+			{
+				Abc_Ntk_t *pNtk = m_vSubNtks[ci];
+				int nPi = 0, nPo = 0, nIfPi = 0, nIfPo = 0;
+				Abc_NtkForEachPi(pNtk, pObj, k)
+				{
+					nPi++;
+					if (pObj->fMarkA)
+						nIfPi++;
+				}
+				Abc_NtkForEachPo(pNtk, pObj, k)
+				{
+					nPo++;
+					if (pObj->fMarkA)
+						nIfPo++;
+				}
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%zu\t%d\t%d\t%d\t%d\t%d",
+						 ci, Abc_NtkNodeNum(pNtk), nPi, nPo, nIfPi, nIfPo);
+				pifTelemetryRow("pif_subntk.tsv",
+								"childIdx\tnInternalNodes\tnPi\tnPo\tnInterfacePi\tnInterfacePo",
+								buf);
+			}
+		}
+
 		// Telemetry: per-child predicted workload in child index order.
 		m_vSubNtkPredWorkload = aig.getPartitionWorkloads();
 		if (m_vSubNtkPredWorkload.size() != m_vSubNtks.size())

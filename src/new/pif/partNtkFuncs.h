@@ -8,14 +8,47 @@
 #include "aig/hop/hop.h"
 #include <sys/time.h>
 #include "yaig.h"
+#include "mffcHypergraph.h"
 #include <map>
 #include <utility>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <climits>
 
 ABC_NAMESPACE_USING_NAMESPACE
 
 namespace ymc
 {
+    // Behavior-neutral telemetry. All writes are gated by the
+    // PIF_TELEMETRY_DIR env var; when unset no file is opened or written
+    // and no selection semantics change. Rows are appended to per-topic
+    // TSV files under that directory. All counts use 64-bit accumulation.
+    inline const char *pifTelemetryDir()
+    {
+        static const char *d = getenv("PIF_TELEMETRY_DIR");
+        return (d && *d) ? d : nullptr;
+    }
+    inline FILE *pifTelemetryFile(const char *name)
+    {
+        const char *d = pifTelemetryDir();
+        if (!d)
+            return nullptr;
+        static char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", d, name);
+        return fopen(path, "a");
+    }
+    inline void pifTelemetryRow(const char *name, const char *header, const char *row)
+    {
+        FILE *f = pifTelemetryFile(name);
+        if (!f)
+            return;
+        if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0)
+            fprintf(f, "%s\n", header);
+        fprintf(f, "%s\n", row);
+        fclose(f);
+    }
+
     struct PartitionConfig
     {
         int32_t targetK = 0;
@@ -169,6 +202,9 @@ namespace ymc
         void parseAig(int32_t userK = 0);
         void parseAigMffc(int32_t userK = 0); // MFFC-based partition entry
         int32_t partitionAigMffc();
+        // Task 17 Stage 2: behavior-neutral PartitionUnit/hypergraph
+        // telemetry over the control partition assignment.
+        void buildHypergraphTelemetry();
 
         // --- Legacy Cone-based methods ---
         void visitAllFaninFromNode(int32_t nodeId, Cone &cone);
@@ -237,6 +273,15 @@ namespace ymc
         vector<int> m_vMffcId2ClusterId; // MFFC ID -> Cluster ID
         bool m_useMffc = false;          // flag: using MFFC or legacy Cone
         int32_t m_forceK = 0;            // non-zero: user requests exactly K partitions
+
+        // Task 17 Stage 2 telemetry state: per post-preprocessing unit,
+        // the strict (pre-merge) MFFC ids it contains and whether it is a
+        // split fragment. Read by telemetry only; never by selection code.
+        vector<vector<int32_t>> m_vUnitOrigins;
+        vector<bool> m_vUnitSplit;
+        // cluster id -> final partition id, captured in partitionAigMffc.
+        vector<int32_t> m_vCluster2PartitionId;
+        MffcHypergraph m_hg;
 
         // MFFC identification
         void identifyMffcs(); // identify all MFFCs in the Yaig
