@@ -456,31 +456,38 @@ namespace ymc
 			std::vector<int32_t> match(n, -1);
 			std::vector<bool> matched(n, false);
 			// Incidence list makes the shared-connectivity scan O(pins)
-			// per level instead of O(|V| * |E| * avgPins).
+			// per level instead of O(|V| * |E| * avgPins). Connectivity is
+			// accumulated into a plain vector and summed by a stable
+			// sort+dedupe (a per-vertex std::map allocates a tree node per
+			// pin and dominates the coarsening cost).
 			for (int32_t i = 0; i < n; i++)
 			{
 				if (matched[i])
 					continue;
-				// shared connectivity of (i, neighbor) = total weight of
-				// hyperedges containing both; iterate incident edges in
-				// ascending edge order and accumulate into a sorted map so
-				// the result is stable.
-				std::map<int32_t, int64_t> conn;
+				std::vector<std::pair<int32_t, int64_t>> conn;
 				for (int32_t ei : in.inc[i])
 				{
 					const HgEdge &e = in.e[ei];
 					for (int32_t p : e.pins)
 						if (p != i && !matched[p])
-							conn[p] += e.weight;
+							conn.push_back({p, e.weight});
 				}
+				std::sort(conn.begin(), conn.end());
 				int32_t best = -1;
 				int64_t bestC = -1;
-				for (const auto &kv : conn)
-					if (kv.second > bestC || (kv.second == bestC && kv.first < best))
+				for (size_t ci = 0; ci < conn.size();)
+				{
+					int64_t w = conn[ci].second;
+					size_t cj = ci + 1;
+					while (cj < conn.size() && conn[cj].first == conn[ci].first)
+						w += conn[cj++].second;
+					if (w > bestC || (w == bestC && conn[ci].first < best))
 					{
-						best = kv.first;
-						bestC = kv.second;
+						best = conn[ci].first;
+						bestC = w;
 					}
+					ci = cj;
+				}
 				if (best >= 0 && in.v[i].weight + in.v[best].weight <= capWeight)
 				{
 					match[i] = best;
@@ -689,6 +696,9 @@ namespace ymc
 
 	std::vector<int32_t> MffcHypergraph::partitionMultiway(int32_t K)
 	{
+		if (getenv("PIF_HG_DEBUG"))
+			ylog("[HG-DBG] partitionMultiway K=%d units=%zu edges=%zu\n",
+				 K, m_units.size(), m_edges.size());
 		const int32_t nUnits = (int32_t)m_units.size();
 		std::vector<int32_t> unit2part(nUnits, 0);
 		if (K <= 1 || nUnits == 0)
@@ -706,6 +716,9 @@ namespace ymc
 						const std::vector<std::vector<int32_t>> &subsetEdges,
 						int32_t k, int32_t basePart)
 		{
+			if (getenv("PIF_HG_DEBUG"))
+				ylog("[HG-DBG] bisect k=%d subset=%zu edges=%zu\n",
+					 k, subset.size(), subsetEdges.size());
 			if (k > (int32_t)subset.size())
 				k = (int32_t)subset.size(); // exact-K feasibility: k <= |subset|
 			if (k <= 1)
@@ -774,6 +787,9 @@ namespace ymc
 					break;
 				nl.buildIncidence();
 				levels.push_back(nl);
+				if (getenv("PIF_HG_DEBUG") && levels.size() <= 8)
+					ylog("[HG-DBG] coarsen level %zu: %zu -> %zu\n",
+						 levels.size(), levels[levels.size() - 2].v.size(), nl.v.size());
 			}
 
 			// initial bisection on the coarsest level
@@ -786,6 +802,9 @@ namespace ymc
 			// cut when that would violate the finest-level bound, otherwise
 			// a giant coarsened vertex silently unbalances the whole split.
 			int64_t slack = std::max<int64_t>(targetW1 / 20, maxW);
+			if (getenv("PIF_HG_DEBUG"))
+				ylog("[HG-DBG] coarsened to %zu levels (finest %zu)\n",
+					 levels.size(), levels[0].v.size());
 			for (int li = (int)levels.size() - 2; li >= 0; li--)
 			{
 				for (const auto &v : levels[li + 1].v)
