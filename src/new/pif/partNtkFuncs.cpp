@@ -4021,8 +4021,23 @@ namespace ymc
 	PartitionConfig MetisAig::determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK)
 	{
 		PartitionConfig config;
-		config.targetK = (userK > 0) ? std::min(userK, (int32_t)mffcWorkloads.size())
-									 : computeAdaptiveMffcTargetK(mffcWorkloads);
+		if (userK > 0)
+		{
+			config.targetK = std::min(userK, (int32_t)mffcWorkloads.size());
+		}
+		else
+		{
+			// Task 18 Stage 5: deterministic dynamic-K rule (J-based).
+			// K = ceil(J/2) where J is the effective child concurrency
+			// (the default pif child cap = hardware_concurrency()/2,
+			// memory-safe at preflight). The Stage 5 screening table
+			// measured the total cost (partition + child makespan +
+			// merge) as monotonic in K on all six frozen designs, with
+			// the minimum at the smallest feasible K and no clstm level
+			// movement; explicit pif -N always overrides this rule.
+			int32_t j = std::max(1, (int32_t)(std::thread::hardware_concurrency() / 2));
+			config.targetK = std::min((j + 1) / 2, (int32_t)mffcWorkloads.size());
+		}
 		config.avgWorkload = (config.targetK > 0) ? (m_iTotalWorkLoad / config.targetK) : 0;
 
 		double sum = 0, sum2 = 0;
