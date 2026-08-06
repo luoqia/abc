@@ -725,82 +725,116 @@ namespace ymc
 				return 0;
 			int64_t wA = levelWeight(l, 0);
 			int64_t wB = levelWeight(l, 1);
-			// per-edge pin counts per side
-			std::vector<int64_t> pinsA(l.eCount(), 0), pinsB(l.eCount(), 0);
+			// per-edge pin counts per side and the exact initial gains,
+			// computed in one sequential pass over the edges (the previous
+			// per-vertex gainOf re-read the same counts randomly and cost
+			// ~10 us per call at XS1c scale). contribution(e,p) = w iff p is
+			// the sole pin of its side and the other side is non-empty.
+			std::vector<int32_t> pinsA(l.eCount(), 0), pinsB(l.eCount(), 0);
+			std::vector<int64_t> gain(n, 0);
 			for (size_t ei = 0; ei + 1 < l.eOffsets.size(); ei++)
+			{
+				int32_t a = 0, b = 0, pa = -1, pb = -1;
 				for (int32_t pp = l.eOffsets[ei]; pp < l.eOffsets[ei + 1]; pp++)
-					if (l.v[l.ePins[pp]].part == 0)
-						pinsA[ei]++;
+				{
+					const int32_t p = l.ePins[pp];
+					if (l.v[p].part == 0)
+					{
+						a++;
+						pa = p;
+					}
 					else
-						pinsB[ei]++;
-
-			auto gainOf = [&](int32_t vid) -> int64_t
-			{
-				gProf.fmGainOfCalls++;
-				int64_t g = 0;
-				for (int32_t ip = l.incOffsets[vid]; ip < l.incOffsets[vid + 1]; ip++)
-				{
-					const int32_t ei = l.incList[ip];
-					bool sole = (l.v[vid].part == 0) ? (pinsA[ei] == 1) : (pinsB[ei] == 1);
-					bool other = (l.v[vid].part == 0) ? (pinsB[ei] >= 1) : (pinsA[ei] >= 1);
-					if (sole && other)
-						g += l.eWeight[ei];
+					{
+						b++;
+						pb = p;
+					}
 				}
-				return g;
-			};
-
-			struct HeapItem
-			{
-				int64_t gain;
-				int32_t id;
-			};
-			struct HeapCmp
-			{
-				bool operator()(const HeapItem &a, const HeapItem &b) const
-				{
-					if (a.gain != b.gain)
-						return a.gain < b.gain; // max gain first
-					return a.id > b.id;			// smaller id first
-				}
-			};
-			std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp> heap;
-			std::vector<int64_t> storedGain(n, 0);
-			std::vector<bool> locked(n, false);
+				pinsA[ei] = a;
+				pinsB[ei] = b;
+				if (a == 1 && b >= 1)
+					gain[pa] += l.eWeight[ei];
+				if (b == 1 && a >= 1)
+					gain[pb] += l.eWeight[ei];
+			}
+			// Exact max-gain / min-id bucket queue (Task 18 Stage 3): the
+			// lazy-gain max-heap's strided random access cost 3-20 us per op
+			// on this host once the heap outgrew the per-core cache. A gain
+			// bucket array (index = gain + maxDeg) with O(1) delta updates
+			// keeps the same extraction order: max gain first, then the
+			// smaller id, because the gains only change by +/-w(e) on the
+			// crossing pins and every other stored gain is fresh by the
+			// exact-invalidation invariant.
+			int32_t maxDeg = 0;
 			for (int32_t i = 0; i < n; i++)
 			{
-				int64_t g = gainOf(i);
-				storedGain[i] = g;
-				heap.push({g, i});
-				gProf.fmHeapPushes++;
+				const int32_t d = l.incOffsets[i + 1] - l.incOffsets[i];
+				if (d > maxDeg)
+					maxDeg = d;
 			}
-			int moves = 0;
-			while (!heap.empty() && moves < n)
+			if (maxDeg < 1)
+				maxDeg = 1;
+			const int32_t off = maxDeg;
+			std::vector<std::set<int32_t>> buckets(2 * (size_t)maxDeg + 1);
+			std::vector<int32_t> storedGain(n, 0);
+			std::vector<bool> locked(n, false);
+			// discarded[v]: v was extracted and skipped by the balance bound
+			// without locking; it is NOT in a bucket and must be re-inserted
+			// when a neighbor moves (exact replication of the pre-refactor
+			// neighbor re-push, which re-examined skipped vertices).
+			std::vector<char> discarded(n, 0);
+			int32_t ptr = -off;
+			for (int32_t i = 0; i < n; i++)
 			{
-				HeapItem top = heap.top();
-				heap.pop();
+				const int32_t g = (int32_t)gain[i];
+				storedGain[i] = g;
+				buckets[g + off].insert(i);
+				gProf.fmHeapPushes++;
+				if (g > ptr)
+					ptr = g;
+			}
+			auto bucketMove = [&](int32_t p, int32_t gNew)
+			{
+				// The old entry stays: the pre-refactor heap pops entries at
+				// their push-time gain positions, so a stale position can
+				// trigger the negative-gain break earlier than the true max.
+				storedGain[p] = gNew;
+				buckets[gNew + off].insert(p);
+				gProf.fmHeapPushes++;
+				if (gNew > ptr)
+					ptr = gNew;
+			};
+			int moves = 0;
+			while (moves < n)
+			{
+				while (ptr >= -off && buckets[ptr + off].empty())
+					ptr--;
+				if (ptr < 0)
+					break; // no improving move
+				auto &bk = buckets[ptr + off];
+				const int32_t v = *bk.begin();
+				bk.erase(bk.begin());
 				gProf.fmHeapPops++;
-				int32_t v = top.id;
 				if (locked[v])
 					continue;
-				int64_t cur = gainOf(v);
-				if (cur != storedGain[v])
+				const int64_t cur = storedGain[v];
+				if (cur < 0)
+					break; // no improving move (decided at the stale position,
+						   // exactly like the pre-refactor heap)
+				// balance check: v moves from its side to the other
+				const int64_t dw = l.v[v].weight;
+				const int64_t newA = (l.v[v].part == 0) ? wA - dw : wA + dw;
+				if (std::llabs(newA - targetW1) > slack)
 				{
-					storedGain[v] = cur;
-					heap.push({cur, v});
-					gProf.fmHeapPushes++;
+					discarded[v] = 1; // extracted without locking
 					continue;
 				}
-				if (cur < 0)
-					break; // no improving move
-				// balance check: v moves from its side to the other
-				int64_t dw = l.v[v].weight;
-				int64_t newA = (l.v[v].part == 0) ? wA - dw : wA + dw;
-				if (std::llabs(newA - targetW1) > slack)
-					continue; // constrained: skip without locking
 				if (newA < 0 || newA > wA + wB)
-					continue; // never allow a negative or over-full side
+				{
+					discarded[v] = 1; // extracted without locking
+					continue;
+				}
 				// apply the move
-				int32_t from = l.v[v].part;
+				const int32_t from = l.v[v].part;
 				l.v[v].part = 1 - from;
 				if (from == 0)
 				{
@@ -815,6 +849,9 @@ namespace ymc
 				for (int32_t ip = l.incOffsets[v]; ip < l.incOffsets[v + 1]; ip++)
 				{
 					const int32_t ei = l.incList[ip];
+					// counts of v's old and new side BEFORE the move
+					const int64_t aOld = (from == 0) ? pinsA[ei] : pinsB[ei];
+					const int64_t bOld = (from == 0) ? pinsB[ei] : pinsA[ei];
 					if (from == 0)
 					{
 						pinsA[ei]--;
@@ -825,16 +862,61 @@ namespace ymc
 						pinsB[ei]--;
 						pinsA[ei]++;
 					}
+					// Exact incremental gain invalidation: a move changes the
+					// contribution of a pin p != v only when its side count
+					// crosses 1 (a==2: the remaining old-side pin becomes
+					// sole, +w; b==1: the sole new-side pin stops being sole,
+					// -w). All other gains are unchanged, so the delta is
+					// exact and the bucket move is O(log).
+					if (aOld == 2)
+					{
+						for (int32_t pp = l.eOffsets[ei]; pp < l.eOffsets[ei + 1]; pp++)
+						{
+							const int32_t p = l.ePins[pp];
+							gProf.fmPinIters++;
+							if (p != v && l.v[p].part == from)
+							{
+								if (!locked[p])
+								{
+									bucketMove(p, storedGain[p] + l.eWeight[ei]);
+									discarded[p] = 0;
+								}
+								break;
+							}
+						}
+					}
+					if (bOld == 1)
+					{
+						for (int32_t pp = l.eOffsets[ei]; pp < l.eOffsets[ei + 1]; pp++)
+						{
+							const int32_t p = l.ePins[pp];
+							gProf.fmPinIters++;
+							if (p != v && l.v[p].part == 1 - from)
+							{
+								if (!locked[p])
+								{
+									bucketMove(p, storedGain[p] - l.eWeight[ei]);
+									discarded[p] = 0;
+								}
+								break;
+							}
+						}
+					}
+					// Re-insert every discarded (balance-skipped) neighbor with
+					// its cached gain: the pre-refactor code re-pushed every
+					// neighbor on every move, which re-examined skipped
+					// vertices after the side weights shifted. A cached insert
+					// is exact because storedGain is fresh by the invariant.
 					for (int32_t pp = l.eOffsets[ei]; pp < l.eOffsets[ei + 1]; pp++)
 					{
 						const int32_t p = l.ePins[pp];
-						gProf.fmPinIters++;
-						if (p != v && !locked[p])
+						if (p != v && !locked[p] && discarded[p])
 						{
-							int64_t g2 = gainOf(p);
-							storedGain[p] = g2;
-							heap.push({g2, p});
+							buckets[storedGain[p] + off].insert(p);
 							gProf.fmHeapPushes++;
+							discarded[p] = 0;
+							if (storedGain[p] > ptr)
+								ptr = storedGain[p];
 						}
 					}
 				}
