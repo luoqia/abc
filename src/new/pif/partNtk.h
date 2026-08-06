@@ -43,7 +43,8 @@ namespace ymc
 				int nMaxConcurrent = 0, const char *tmpDir = nullptr,
 				bool fStrict = false)
 			: m_nParts(nParts), m_pOriginNtk(pNtkOrigin), m_sCluster(sCluster),
-			  m_nMaxConcurrent(nMaxConcurrent), m_fStrict(fStrict)
+			  m_nMaxConcurrent(nMaxConcurrent), m_fStrict(fStrict),
+			  m_effectiveJ(pifResolveEffectiveJ(nMaxConcurrent))
 		{
 			snprintf(m_dirName, sizeof(m_dirName), "%s", dirName);
 			if (optScript && strlen(optScript) > 0)
@@ -99,6 +100,7 @@ namespace ymc
 
 		// pif engineering hardening (Task 11)
 		int m_nMaxConcurrent = 0;  // -j N: explicit child-process cap; 0 = default policy
+		int m_effectiveJ = 0;      // resolved effective J (Task 19 Stage 3), shared with the K rule
 		std::string m_tmpDir;      // -t <dir>: per-child temporary files; default /dev/shm
 		bool m_fStrict = false;    // -e: a failed/missing/malformed child result fails pif
 		bool m_fPipelineFailed = false;

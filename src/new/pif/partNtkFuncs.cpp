@@ -4018,24 +4018,27 @@ namespace ymc
 		return K;
 	}
 
-	PartitionConfig MetisAig::determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK)
+	PartitionConfig MetisAig::determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK, int32_t effectiveJ)
 	{
 		PartitionConfig config;
+		// Effective child concurrency J, shared with the child scheduler:
+		// explicit pif -j wins, otherwise Linux sched_getaffinity
+		// (cpuset/affinity aware) with a hardware-concurrency fallback,
+		// default half the allowed CPUs with a minimum of one.
+		int32_t j = effectiveJ > 0 ? effectiveJ : pifResolveEffectiveJ(0);
 		if (userK > 0)
 		{
 			config.targetK = std::min(userK, (int32_t)mffcWorkloads.size());
 		}
 		else
 		{
-			// Task 18 Stage 5: deterministic dynamic-K rule (J-based).
-			// K = ceil(J/2) where J is the effective child concurrency
-			// (the default pif child cap = hardware_concurrency()/2,
-			// memory-safe at preflight). The Stage 5 screening table
-			// measured the total cost (partition + child makespan +
-			// merge) as monotonic in K on all six frozen designs, with
-			// the minimum at the smallest feasible K and no clstm level
-			// movement; explicit pif -N always overrides this rule.
-			int32_t j = std::max(1, (int32_t)(std::thread::hardware_concurrency() / 2));
+			// Task 18 Stage 5 / Task 19 Stage 3: deterministic dynamic-K
+			// rule (J-based). K = ceil(J/2) with the same resolved J the
+			// scheduler consumes. The Stage 5 screening table measured the
+			// total cost (partition + child makespan + merge) as monotonic
+			// in K on all six frozen designs, with the minimum at the
+			// smallest feasible K and no clstm level movement; explicit
+			// pif -N always overrides this rule.
 			config.targetK = std::min((j + 1) / 2, (int32_t)mffcWorkloads.size());
 		}
 		config.avgWorkload = (config.targetK > 0) ? (m_iTotalWorkLoad / config.targetK) : 0;
@@ -4053,8 +4056,8 @@ namespace ymc
 		double factor = std::min(3.0, 1.5 + std::min(cv, 3.0) * 0.5);
 		config.workloadLimit = (config.targetK == 1) ? m_iTotalWorkLoad : (int64_t)(config.avgWorkload * factor);
 
-		ylog("[MFFC] Config: K=%d, avgWL=%lld, limit=%lld\n",
-			 config.targetK, (long long)config.avgWorkload, (long long)config.workloadLimit);
+		ylog("[MFFC] Config: K=%d, J=%d, avgWL=%lld, limit=%lld\n",
+			 config.targetK, j, (long long)config.avgWorkload, (long long)config.workloadLimit);
 		{
 			char buf[256];
 			snprintf(buf, sizeof(buf), "%d\t%d\t%lld\t%lld\t%.4f\t%.4f\t%.4f\t%.4f\t%d",
@@ -4767,13 +4770,13 @@ namespace ymc
 		printClusters();
 	}
 
-	void MetisAig::parseAigMffc(int32_t userK)
+	void MetisAig::parseAigMffc(int32_t userK, int32_t effectiveJ)
 	{
 		m_useMffc = true;
 		m_forceK = userK;
 		vector<int32_t> mffcWorkloads;
 		preprocessMffcs(mffcWorkloads);
-		PartitionConfig config = determineMffcPartitionConfig(mffcWorkloads, userK);
+		PartitionConfig config = determineMffcPartitionConfig(mffcWorkloads, userK, effectiveJ);
 		runHypergraphPartitioning(config, mffcWorkloads);
 	}
 

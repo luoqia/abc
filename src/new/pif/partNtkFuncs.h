@@ -191,6 +191,15 @@ namespace ymc
         vector<int32_t> vClusterIds;
     };
 
+    // Task 19 Stage 3: effective child concurrency J, shared by the child
+    // scheduler and the adaptive K rule K=ceil(J/2). An explicit positive
+    // pif -j is authoritative; otherwise the allowed CPU count comes from
+    // Linux sched_getaffinity (cpuset/affinity aware) with a portable
+    // hardware-concurrency fallback; the default policy is half the allowed
+    // CPUs with a minimum of one. No memory query is made here; a
+    // memory-safe cap is supplied explicitly through pif -j.
+    int pifResolveEffectiveJ(int explicitJ);
+
     class MetisAig : public Yaig // for analysing the original NTK
     {
     public:
@@ -200,7 +209,7 @@ namespace ymc
         const std::vector<int64_t> &getPartitionWorkloads() const { return m_vPartitionWorkload; }
 
         void parseAig(int32_t userK = 0);
-        void parseAigMffc(int32_t userK = 0); // MFFC-based partition entry
+        void parseAigMffc(int32_t userK = 0, int32_t effectiveJ = 0); // MFFC-based partition entry; effectiveJ = shared effective child concurrency J
         int32_t partitionAigMffc();
         // Task 17 Stage 2: behavior-neutral PartitionUnit/hypergraph
         // telemetry over the control partition assignment.
@@ -295,7 +304,7 @@ namespace ymc
 
         // MFFC-based clustering (mirrors Cone-based but uses MffcUnit)
         void preprocessMffcs(vector<int32_t> &outMffcWorkloads);
-        PartitionConfig determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK);
+        PartitionConfig determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK, int32_t effectiveJ = 0);
         int32_t computeAdaptiveMffcTargetK(const vector<int32_t> &mffcWorkloads);
         void runMffcClusteringAlgorithm(const PartitionConfig &config, const vector<int32_t> &mffcWorkloads);
         int findBestClusterForMffc(int mffcIdx, const PartitionConfig &config,

@@ -2,6 +2,7 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/types.h>
 #include <unordered_map>
 #include <fcntl.h>
@@ -38,6 +39,22 @@ namespace ymc
 			fprintf(f, "%s\n", row);
 			fclose(f);
 		}
+	} // anonymous namespace
+
+	int pifResolveEffectiveJ(int explicitJ)
+	{
+		if (explicitJ > 0)
+			return explicitJ;
+		int allowed = 0;
+#if defined(__linux__)
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		if (sched_getaffinity(0, sizeof(set), &set) == 0)
+			allowed = CPU_COUNT(&set);
+#endif
+		if (allowed < 1)
+			allowed = (int)std::thread::hardware_concurrency();
+		return std::max(1, allowed / 2);
 	}
 
 	// ---------------------------------------------------------------------------
@@ -345,9 +362,9 @@ namespace ymc
 		ylog("Opt script: %s\n", m_optScript.c_str());
 		ylog("Map type:   %s\n", m_mapType.c_str());
 		if (m_nMaxConcurrent > 0)
-			ylog("Concurrency cap: %d\n", m_nMaxConcurrent);
+			ylog("Concurrency cap: %d (explicit -j)\n", m_nMaxConcurrent);
 		else
-			ylog("Concurrency cap: default (hw/2)\n");
+			ylog("Concurrency cap: default (allowed CPUs / 2 = %d)\n", m_effectiveJ);
 		ylog("Task tmp dir:    %s\n", m_tmpDir.c_str());
 		ylog("Strict mode:     %s\n", m_fStrict ? "on" : "off");
 		if (!m_libPath.empty())
@@ -407,7 +424,7 @@ namespace ymc
 
 		if (m_useMffc)
 		{
-			aig.parseAigMffc(m_nParts);
+			aig.parseAigMffc(m_nParts, m_effectiveJ);
 			m_nParts = aig.partitionAigMffc();
 		}
 		else
@@ -623,10 +640,7 @@ namespace ymc
 		m_vSubNtksOptimized.resize(nTasks, nullptr);
 		m_stats.timeSubNtksOpt.resize(nTasks);
 
-		int max_concurrent = m_nMaxConcurrent > 0 ? m_nMaxConcurrent
-												  : (std::thread::hardware_concurrency() / 2);
-		if (max_concurrent < 1)
-			max_concurrent = 1;
+		int max_concurrent = m_effectiveJ;
 
 		int running_procs = 0;
 		pid_t my_pid = getpid();
