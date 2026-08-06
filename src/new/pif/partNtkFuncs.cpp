@@ -4707,7 +4707,12 @@ namespace ymc
 		// post-preprocessing PartitionUnits. Target K comes from the same
 		// explicit-K or adaptive-K calculation as the control; exactly K
 		// non-empty parts are produced (K = min(targetK, nM)).
+		if (getenv("PIF_HG_DEBUG"))
+			ylog("[HG-DBG] runHypergraphPartitioning: build start\n");
 		m_hg.build(m_vNodes, m_vNode2MffcId, m_vMffcs, m_vUnitOrigins, m_vUnitSplit);
+		if (getenv("PIF_HG_DEBUG"))
+			ylog("[HG-DBG] hypergraph built: units=%lld edges=%lld\n",
+				 (long long)m_hg.nUnits(), (long long)m_hg.nEdges());
 		int32_t K = std::min(config.targetK, (int32_t)m_vMffcs.size());
 		if (K < 1)
 			K = 1;
