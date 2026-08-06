@@ -3,6 +3,7 @@
 #include "yaig.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -12,6 +13,80 @@
 
 namespace ymc
 {
+	// Task 18 Stage 2: opt-in, behavior-neutral scale profiler.
+	// Gated by the PIF_HG_PROFILE environment variable (disabled by
+	// default). It only reads clocks and counters; no selection state is
+	// read or written, so assignments are byte-identical with and without
+	// profiling. Rows are emitted with ylog to stderr.
+	struct HgProfiler
+	{
+		bool on = false;
+		bool initDone = false;
+		int64_t t0 = 0;
+		int64_t levelScanIts = 0;	   // conn-scan inner iterations (pins visited)
+		int64_t levelSortIts = 0;	   // conn entries consumed by sort+dedupe
+		int64_t levelRebuildEdges = 0; // edges projected during rebuild
+		int64_t levelRebuildPins = 0;  // pins written during rebuild
+		int64_t levelTouchedPins = 0;  // pins of edges incident to matched vertices
+		int64_t levelPairs = 0;
+		int64_t levelSingles = 0;
+		int64_t levelScanNs = 0;
+		int64_t levelSortNs = 0;
+		int64_t levelRebuildNs = 0;
+		int64_t nLevels = 0;
+		int64_t tProjectNs = 0, tCoarsenNs = 0, tFmNs = 0, tRepairNs = 0;
+		int64_t tSplitNs = 0, tBisectNs = 0;
+		int64_t scanItsBisect = 0, rebuildPinsBisect = 0, touchedPinsBisect = 0;
+		int64_t nBisections = 0;
+		int64_t tBuildNs = 0;
+		// global accumulators (resetBisect at recursion entry must not
+		// destroy totals; accumulated at each bisect-row emission)
+		int64_t gTotLevels = 0, gTotScanIts = 0, gTotRebuildPins = 0, gTotTouchedPins = 0;
+		// FM-internal counters (per level; emitted in the fm row)
+		int64_t fmGainOfCalls = 0, fmHeapPushes = 0, fmHeapPops = 0, fmPinIters = 0;
+
+		int64_t nowNs() const
+		{
+			return std::chrono::steady_clock::now().time_since_epoch().count();
+		}
+		void maybeInit()
+		{
+			if (!initDone)
+			{
+				on = getenv("PIF_HG_PROFILE") != nullptr;
+				if (on)
+					t0 = nowNs();
+				initDone = true;
+			}
+		}
+		void resetLevel()
+		{
+			levelScanIts = levelSortIts = levelRebuildEdges = levelRebuildPins = 0;
+			levelTouchedPins = levelPairs = levelSingles = 0;
+			levelScanNs = levelSortNs = levelRebuildNs = 0;
+		}
+		void resetBisect()
+		{
+			nLevels = 0;
+			tProjectNs = tCoarsenNs = tFmNs = tRepairNs = tSplitNs = tBisectNs = 0;
+			scanItsBisect = rebuildPinsBisect = touchedPinsBisect = 0;
+		}
+		int64_t hwmKb()
+		{
+			FILE *f = fopen("/proc/self/status", "r");
+			if (!f)
+				return -1;
+			char line[256];
+			int64_t hwm = -1;
+			while (fgets(line, sizeof(line), f))
+				if (sscanf(line, "VmHWM: %lld kB", &hwm) == 1)
+					break;
+			fclose(f);
+			return hwm;
+		}
+	};
+	static HgProfiler gProf;
+
 	namespace
 	{
 		// Yaig reserves node 0 = NONE, node 1 = CONST (see yaig.h).
@@ -56,6 +131,8 @@ namespace ymc
 							   const std::vector<std::vector<int32_t>> &origins,
 							   const std::vector<bool> &splitFlags)
 	{
+		gProf.maybeInit();
+		int64_t tBuild0 = gProf.nowNs();
 		clear();
 
 		// ---- vertex table: post-preprocessing PartitionUnits ----
@@ -248,6 +325,11 @@ namespace ymc
 			m_nSingletonEdges++;
 			m_nPinsTotal += e.fanout;
 		}
+		gProf.tBuildNs += gProf.nowNs() - tBuild0;
+		if (gProf.on)
+			ylog("[HG-PROF] build wallMs=%.3f units=%lld edges=%lld pins=%lld\n",
+				 gProf.tBuildNs / 1e6, (long long)nUnits(), (long long)nEdges(),
+				 (long long)nPinsTotal());
 	}
 
 	void MffcHypergraph::assignControl(const std::vector<int32_t> &unit2partition)
@@ -409,7 +491,6 @@ namespace ymc
 	//      distributed proportionally (k1 = k/2, k2 = k - k1).
 	// Every loop iterates ascending ids; every tie-break is by the smaller
 	// id. No random state is used anywhere.
-	// ================================================================
 	namespace
 	{
 		struct HgVtx
@@ -452,6 +533,8 @@ namespace ymc
 		// 'out'. Returns false when no contraction happened.
 		bool hgCoarsen(const HgLevel &in, HgLevel &out, int64_t capWeight)
 		{
+			gProf.maybeInit();
+			gProf.resetLevel();
 			const int32_t n = (int32_t)in.v.size();
 			std::vector<int32_t> match(n, -1);
 			std::vector<bool> matched(n, false);
@@ -460,6 +543,7 @@ namespace ymc
 			// accumulated into a plain vector and summed by a stable
 			// sort+dedupe (a per-vertex std::map allocates a tree node per
 			// pin and dominates the coarsening cost).
+			int64_t tScan0 = gProf.nowNs();
 			for (int32_t i = 0; i < n; i++)
 			{
 				if (matched[i])
@@ -469,10 +553,16 @@ namespace ymc
 				{
 					const HgEdge &e = in.e[ei];
 					for (int32_t p : e.pins)
+					{
+						gProf.levelScanIts++;
 						if (p != i && !matched[p])
 							conn.push_back({p, e.weight});
+					}
 				}
+				int64_t tSort0 = gProf.nowNs();
 				std::sort(conn.begin(), conn.end());
+				gProf.levelSortIts += (int64_t)conn.size();
+				gProf.levelSortNs += gProf.nowNs() - tSort0;
 				int32_t best = -1;
 				int64_t bestC = -1;
 				for (size_t ci = 0; ci < conn.size();)
@@ -495,6 +585,16 @@ namespace ymc
 					matched[i] = matched[best] = true;
 				}
 			}
+			gProf.levelScanNs += gProf.nowNs() - tScan0;
+			if (gProf.on)
+			{
+				// exact incremental-work estimate: pins of edges incident to
+				// any matched vertex (what an incremental update would touch)
+				for (int32_t i = 0; i < n; i++)
+					if (matched[i])
+						for (int32_t ei : in.inc[i])
+							gProf.levelTouchedPins += (int64_t)in.e[ei].pins.size();
+			}
 			std::vector<int32_t> toNew(n, -1);
 			int32_t next = 0;
 			for (int32_t i = 0; i < n; i++)
@@ -502,6 +602,7 @@ namespace ymc
 				if (match[i] < 0)
 				{
 					toNew[i] = next++;
+					gProf.levelSingles++;
 					HgVtx v;
 					v.id = in.v[i].id;
 					v.weight = in.v[i].weight;
@@ -517,6 +618,7 @@ namespace ymc
 				else if (i < match[i])
 				{
 					toNew[i] = toNew[match[i]] = next++;
+					gProf.levelPairs++;
 					HgVtx v;
 					v.id = std::min(in.v[i].id, in.v[match[i]].id);
 					v.weight = in.v[i].weight + in.v[match[i]].weight;
@@ -527,8 +629,11 @@ namespace ymc
 			}
 			if (out.v.size() >= in.v.size())
 				return false;
+			int64_t tReb0 = gProf.nowNs();
 			for (const auto &e : in.e)
 			{
+				gProf.levelRebuildEdges++;
+				gProf.levelRebuildPins += (int64_t)e.pins.size();
 				std::vector<int32_t> pins;
 				pins.reserve(e.pins.size());
 				for (int32_t p : e.pins)
@@ -544,6 +649,7 @@ namespace ymc
 					out.e.push_back(ne);
 				}
 			}
+			gProf.levelRebuildNs += gProf.nowNs() - tReb0;
 			return true;
 		}
 
@@ -577,11 +683,12 @@ namespace ymc
 		// ascending id. Gain of moving v to the other side = total weight of
 		// hyperedges where v is the sole pin of its side and the other side
 		// has at least one pin (connectivity and cut-net both improve).
-		void hgFmRefine(HgLevel &l, int64_t targetW1, int64_t slack)
+		int64_t hgFmRefine(HgLevel &l, int64_t targetW1, int64_t slack)
 		{
 			const int32_t n = (int32_t)l.v.size();
+			gProf.fmGainOfCalls = gProf.fmHeapPushes = gProf.fmHeapPops = gProf.fmPinIters = 0;
 			if (n < 2)
-				return;
+				return 0;
 			int64_t wA = levelWeight(l, 0);
 			int64_t wB = levelWeight(l, 1);
 			// per-edge pin counts per side
@@ -595,6 +702,7 @@ namespace ymc
 
 			auto gainOf = [&](int32_t vid) -> int64_t
 			{
+				gProf.fmGainOfCalls++;
 				int64_t g = 0;
 				for (int32_t ei : l.inc[vid])
 				{
@@ -629,12 +737,14 @@ namespace ymc
 				int64_t g = gainOf(i);
 				storedGain[i] = g;
 				heap.push({g, i});
+				gProf.fmHeapPushes++;
 			}
 			int moves = 0;
 			while (!heap.empty() && moves < n)
 			{
 				HeapItem top = heap.top();
 				heap.pop();
+				gProf.fmHeapPops++;
 				int32_t v = top.id;
 				if (locked[v])
 					continue;
@@ -643,6 +753,7 @@ namespace ymc
 				{
 					storedGain[v] = cur;
 					heap.push({cur, v});
+					gProf.fmHeapPushes++;
 					continue;
 				}
 				if (cur < 0)
@@ -681,16 +792,21 @@ namespace ymc
 						pinsA[ei]++;
 					}
 					for (int32_t p : e.pins)
+					{
+						gProf.fmPinIters++;
 						if (p != v && !locked[p])
 						{
 							int64_t g2 = gainOf(p);
 							storedGain[p] = g2;
 							heap.push({g2, p});
+							gProf.fmHeapPushes++;
 						}
+					}
 				}
 				locked[v] = true;
 				moves++;
 			}
+			return moves;
 		}
 	} // namespace
 
@@ -711,11 +827,15 @@ namespace ymc
 		// subset; each level filters only its parent's edges instead of
 		// rescanning the whole hypergraph (O(edges) per bisection would be
 		// quadratic over the recursion tree).
-		std::function<void(const std::vector<int32_t> &, const std::vector<std::vector<int32_t>> &, int32_t, int32_t)> bisectRec;
+		std::function<void(const std::vector<int32_t> &, const std::vector<std::vector<int32_t>> &, int32_t, int32_t, int32_t)> bisectRec;
 		bisectRec = [&](const std::vector<int32_t> &subset,
 						const std::vector<std::vector<int32_t>> &subsetEdges,
-						int32_t k, int32_t basePart)
+						int32_t k, int32_t basePart, int32_t depth)
 		{
+			gProf.maybeInit();
+			gProf.resetBisect();
+			gProf.nBisections++;
+			int64_t tBisect0 = gProf.nowNs();
 			if (getenv("PIF_HG_DEBUG"))
 				ylog("[HG-DBG] bisect k=%d subset=%zu edges=%zu\n",
 					 k, subset.size(), subsetEdges.size());
@@ -741,6 +861,7 @@ namespace ymc
 			// induced hypergraph on the subset
 			HgLevel l0;
 			{
+				int64_t tProj0 = gProf.nowNs();
 				std::unordered_map<int32_t, int32_t> u2idx;
 				u2idx.reserve(subset.size() * 2);
 				for (int32_t u : subset)
@@ -773,6 +894,7 @@ namespace ymc
 						l0.e.push_back(ne);
 					}
 				}
+				gProf.tProjectNs += gProf.nowNs() - tProj0;
 			}
 
 			// coarsen (cap keeps any coarsened vertex bisectable)
@@ -783,8 +905,40 @@ namespace ymc
 			while (levels.back().v.size() > 1)
 			{
 				HgLevel nl;
-				if (!hgCoarsen(levels.back(), nl, capW))
+				int64_t tC0 = gProf.nowNs();
+				bool contracted = hgCoarsen(levels.back(), nl, capW);
+				gProf.tCoarsenNs += gProf.nowNs() - tC0;
+				if (gProf.on)
+				{
+					int64_t maxWl = 0;
+					const HgLevel &src = contracted ? nl : levels.back();
+					for (const auto &v : src.v)
+						if (v.weight > maxWl)
+							maxWl = v.weight;
+					int64_t pinsLv = 0;
+					for (const auto &e : levels.back().e)
+						pinsLv += (int64_t)e.pins.size();
+					ylog("[HG-PROF] level d=%d k=%d li=%zu vIn=%zu vOut=%zu e=%zu pins=%lld "
+						 "pairs=%lld singles=%lld ratio=%.6f maxW=%lld scanIts=%lld sortIts=%lld "
+						 "touchedPins=%lld rebuildE=%lld rebuildPins=%lld scanMs=%.3f sortMs=%.3f "
+						 "rebuildMs=%.3f reason=%s\n",
+						 depth, k, levels.size(), levels.back().v.size(), src.v.size(),
+						 levels.back().e.size(), (long long)pinsLv, (long long)gProf.levelPairs,
+						 (long long)gProf.levelSingles,
+						 src.v.size() ? (double)src.v.size() / levels.back().v.size() : 0.0,
+						 (long long)maxWl, (long long)gProf.levelScanIts,
+						 (long long)gProf.levelSortIts, (long long)gProf.levelTouchedPins,
+						 (long long)gProf.levelRebuildEdges, (long long)gProf.levelRebuildPins,
+						 gProf.levelScanNs / 1e6, gProf.levelSortNs / 1e6,
+						 gProf.levelRebuildNs / 1e6,
+						 contracted ? "ok" : "no_contraction");
+				}
+				if (!contracted)
 					break;
+				gProf.nLevels++;
+				gProf.scanItsBisect += gProf.levelScanIts;
+				gProf.rebuildPinsBisect += gProf.levelRebuildPins;
+				gProf.touchedPinsBisect += gProf.levelTouchedPins;
 				nl.buildIncidence();
 				levels.push_back(nl);
 				if (getenv("PIF_HG_DEBUG") && levels.size() <= 8)
@@ -805,13 +959,24 @@ namespace ymc
 			if (getenv("PIF_HG_DEBUG"))
 				ylog("[HG-DBG] coarsened to %zu levels (finest %zu)\n",
 					 levels.size(), levels[0].v.size());
+			int64_t tFm0 = gProf.nowNs();
 			for (int li = (int)levels.size() - 2; li >= 0; li--)
 			{
 				for (const auto &v : levels[li + 1].v)
 					for (int32_t c : v.children)
 						levels[li].v[c].part = v.part;
-				hgFmRefine(levels[li], targetW1, slack);
+				int64_t tF1 = gProf.nowNs();
+				int64_t fmMoves = hgFmRefine(levels[li], targetW1, slack);
+				int64_t tF2 = gProf.nowNs();
+				if (gProf.on)
+					ylog("[HG-PROF] fm d=%d k=%d li=%d v=%zu e=%zu moves=%lld ms=%.3f "
+						 "gainOf=%lld pushes=%lld pops=%lld pinIters=%lld\n",
+						 depth, k, li, levels[li].v.size(), levels[li].e.size(),
+						 (long long)fmMoves, (tF2 - tF1) / 1e6,
+						 (long long)gProf.fmGainOfCalls, (long long)gProf.fmHeapPushes,
+						 (long long)gProf.fmHeapPops, (long long)gProf.fmPinIters);
 			}
+			gProf.tFmNs += gProf.nowNs() - tFm0;
 
 			// split the subset by the finest-level parts
 			std::vector<int32_t> a, b;
@@ -857,8 +1022,10 @@ namespace ymc
 				// oversized indivisible unit on a side is the explicit
 				// balance exception allowed by the packet
 			};
+			int64_t tRep0 = gProf.nowNs();
 			sizeRepair(a, k1, b, k2);
 			sizeRepair(b, k2, a, k1);
+			gProf.tRepairNs += gProf.nowNs() - tRep0;
 			if (a.empty() || b.empty())
 			{
 				for (int32_t u : subset)
@@ -869,6 +1036,7 @@ namespace ymc
 			// induced edge lists (each edge keeps its unit-id pins)
 			std::vector<std::vector<int32_t>> aEdges, bEdges;
 			{
+				int64_t tSp0 = gProf.nowNs();
 				std::vector<char> inA(nUnits, 0);
 				for (int32_t u : a)
 					inA[u] = 1;
@@ -885,9 +1053,28 @@ namespace ymc
 					if (pb.size() >= 2)
 						bEdges.push_back(std::move(pb));
 				}
+				gProf.tSplitNs += gProf.nowNs() - tSp0;
 			}
-			bisectRec(a, aEdges, k1, basePart);
-			bisectRec(b, bEdges, k2, basePart + k1);
+			gProf.tBisectNs += gProf.nowNs() - tBisect0;
+			if (gProf.on)
+			{
+				gProf.gTotLevels += gProf.nLevels;
+				gProf.gTotScanIts += gProf.scanItsBisect;
+				gProf.gTotRebuildPins += gProf.rebuildPinsBisect;
+				gProf.gTotTouchedPins += gProf.touchedPinsBisect;
+				ylog("[HG-PROF] bisect d=%d k=%d subset=%zu edges=%zu levels=%lld "
+					 "wallMs=%.3f projectMs=%.3f coarsenMs=%.3f fmMs=%.3f repairMs=%.3f "
+					 "splitMs=%.3f scanIts=%lld rebuildPins=%lld touchedPins=%lld rssKb=%lld\n",
+					 depth, k, subset.size(), subsetEdges.size(),
+					 (long long)gProf.nLevels,
+					 gProf.tBisectNs / 1e6, gProf.tProjectNs / 1e6,
+					 gProf.tCoarsenNs / 1e6, gProf.tFmNs / 1e6,
+					 gProf.tRepairNs / 1e6, gProf.tSplitNs / 1e6,
+					 (long long)gProf.scanItsBisect, (long long)gProf.rebuildPinsBisect,
+					 (long long)gProf.touchedPinsBisect, (long long)gProf.hwmKb());
+			}
+			bisectRec(a, aEdges, k1, basePart, depth + 1);
+			bisectRec(b, bEdges, k2, basePart + k1, depth + 1);
 		};
 
 		std::vector<int32_t> all(nUnits);
@@ -896,7 +1083,13 @@ namespace ymc
 		allEdges.reserve(m_edges.size());
 		for (const auto &e : m_edges)
 			allEdges.push_back(e.pins);
-		bisectRec(all, allEdges, K, 0);
+		bisectRec(all, allEdges, K, 0, 0);
+		if (gProf.on)
+			ylog("[HG-PROF] summary bisections=%lld levels=%lld scanIts=%lld "
+				 "rebuildPins=%lld touchedPins=%lld rssKb=%lld\n",
+				 (long long)gProf.nBisections, (long long)gProf.gTotLevels,
+				 (long long)gProf.gTotScanIts, (long long)gProf.gTotRebuildPins,
+				 (long long)gProf.gTotTouchedPins, (long long)gProf.hwmKb());
 		return unit2part;
 	}
 
