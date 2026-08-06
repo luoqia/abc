@@ -500,23 +500,34 @@ namespace ymc
 			int32_t part; // 0/1 during a bisection
 			std::vector<int32_t> children; // vertex indices at the finer level
 		};
-		struct HgEdge
-		{
-			int32_t id;
-			std::vector<int32_t> pins; // vertex indices at this level
-			int32_t weight;
-		};
+		// Task 18 Stage 3: flat compact level storage (assignment-identical).
+		// The old HgEdge vector-of-vectors (one heap allocation per edge pin
+		// list and per-vertex incidence list) cost 7-34 us per FM heap op at
+		// XS1c scale because every dereference missed into DRAM. Edges and
+		// incidence are now CSR arrays with the SAME iteration order, so
+		// every access is contiguous and the decisions are byte-identical.
 		struct HgLevel
 		{
 			std::vector<HgVtx> v;
-			std::vector<HgEdge> e;
-			std::vector<std::vector<int32_t>> inc; // vertex -> incident edge indices
+			std::vector<int32_t> eOffsets; // size eCount()+1; ePins[eOffsets[ei]..eOffsets[ei+1])
+			std::vector<int32_t> ePins;	// contiguous pin lists (sorted, unique)
+			std::vector<int32_t> eWeight;	// uniform 1 (frozen objective)
+			std::vector<int32_t> incOffsets; // size v.size()+1 (CSR)
+			std::vector<int32_t> incList;	// contiguous incident edge ids
+			size_t eCount() const { return eOffsets.size() - 1; }
 			void buildIncidence()
 			{
-				inc.assign(v.size(), {});
-				for (size_t ei = 0; ei < e.size(); ei++)
-					for (int32_t p : e[ei].pins)
-						inc[p].push_back((int32_t)ei);
+				incOffsets.assign(v.size() + 1, 0);
+				for (size_t ei = 0; ei + 1 < eOffsets.size(); ei++)
+					for (int32_t pi = eOffsets[ei]; pi < eOffsets[ei + 1]; pi++)
+						incOffsets[ePins[pi] + 1]++;
+				for (size_t i = 1; i < incOffsets.size(); i++)
+					incOffsets[i] += incOffsets[i - 1];
+				incList.assign(incOffsets.back(), 0);
+				std::vector<int32_t> cur(incOffsets.begin(), incOffsets.end() - 1);
+				for (size_t ei = 0; ei + 1 < eOffsets.size(); ei++)
+					for (int32_t pi = eOffsets[ei]; pi < eOffsets[ei + 1]; pi++)
+						incList[cur[ePins[pi]]++] = (int32_t)ei;
 			}
 		};
 
@@ -538,7 +549,7 @@ namespace ymc
 			const int32_t n = (int32_t)in.v.size();
 			std::vector<int32_t> match(n, -1);
 			std::vector<bool> matched(n, false);
-			// Incidence list makes the shared-connectivity scan O(pins)
+			// CSR incidence makes the shared-connectivity scan O(pins)
 			// per level instead of O(|V| * |E| * avgPins). Connectivity is
 			// accumulated into a plain vector and summed by a stable
 			// sort+dedupe (a per-vertex std::map allocates a tree node per
@@ -549,14 +560,15 @@ namespace ymc
 				if (matched[i])
 					continue;
 				std::vector<std::pair<int32_t, int64_t>> conn;
-				for (int32_t ei : in.inc[i])
+				for (int32_t ip = in.incOffsets[i]; ip < in.incOffsets[i + 1]; ip++)
 				{
-					const HgEdge &e = in.e[ei];
-					for (int32_t p : e.pins)
+					const int32_t ei = in.incList[ip];
+					for (int32_t pp = in.eOffsets[ei]; pp < in.eOffsets[ei + 1]; pp++)
 					{
+						const int32_t p = in.ePins[pp];
 						gProf.levelScanIts++;
 						if (p != i && !matched[p])
-							conn.push_back({p, e.weight});
+							conn.push_back({p, in.eWeight[ei]});
 					}
 				}
 				int64_t tSort0 = gProf.nowNs();
@@ -586,14 +598,21 @@ namespace ymc
 				}
 			}
 			gProf.levelScanNs += gProf.nowNs() - tScan0;
-			if (gProf.on)
+			// exact incremental-work estimate: pins of edges incident to any
+			// matched vertex (what an incremental update would touch). The
+			// same pass marks the edges whose pin list must be resorted.
+			std::vector<char> eTouched(in.eCount(), 0);
 			{
-				// exact incremental-work estimate: pins of edges incident to
-				// any matched vertex (what an incremental update would touch)
 				for (int32_t i = 0; i < n; i++)
 					if (matched[i])
-						for (int32_t ei : in.inc[i])
-							gProf.levelTouchedPins += (int64_t)in.e[ei].pins.size();
+						for (int32_t ip = in.incOffsets[i]; ip < in.incOffsets[i + 1]; ip++)
+						{
+							const int32_t ei = in.incList[ip];
+							eTouched[ei] = 1;
+							if (gProf.on)
+								gProf.levelTouchedPins +=
+									(int64_t)(in.eOffsets[ei + 1] - in.eOffsets[ei]);
+						}
 			}
 			std::vector<int32_t> toNew(n, -1);
 			int32_t next = 0;
@@ -630,23 +649,38 @@ namespace ymc
 			if (out.v.size() >= in.v.size())
 				return false;
 			int64_t tReb0 = gProf.nowNs();
-			for (const auto &e : in.e)
+			out.eOffsets.push_back(0);
+			// toNew is non-decreasing in the old index, so an edge with no
+			// contracted pin renumbers pointwise into a list that is still
+			// sorted and unique; only edges incident to a matched vertex need
+			// the sort+unique (exact duplicate handling as before).
+			for (size_t ei = 0; ei + 1 < in.eOffsets.size(); ei++)
 			{
 				gProf.levelRebuildEdges++;
-				gProf.levelRebuildPins += (int64_t)e.pins.size();
-				std::vector<int32_t> pins;
-				pins.reserve(e.pins.size());
-				for (int32_t p : e.pins)
-					pins.push_back(toNew[p]);
-				std::sort(pins.begin(), pins.end());
-				pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
-				if (pins.size() >= 2)
+				const int32_t lo = in.eOffsets[ei], hi = in.eOffsets[ei + 1];
+				gProf.levelRebuildPins += (int64_t)(hi - lo);
+				const int32_t base = (int32_t)out.ePins.size();
+				if (!eTouched[ei])
 				{
-					HgEdge ne;
-					ne.id = e.id;
-					ne.pins = pins;
-					ne.weight = e.weight;
-					out.e.push_back(ne);
+					for (int32_t pp = lo; pp < hi; pp++)
+						out.ePins.push_back(toNew[in.ePins[pp]]);
+				}
+				else
+				{
+					for (int32_t pp = lo; pp < hi; pp++)
+						out.ePins.push_back(toNew[in.ePins[pp]]);
+					std::sort(out.ePins.begin() + base, out.ePins.end());
+					out.ePins.erase(std::unique(out.ePins.begin() + base, out.ePins.end()),
+									out.ePins.end());
+				}
+				if ((int32_t)out.ePins.size() - base >= 2)
+				{
+					out.eWeight.push_back(in.eWeight[ei]);
+					out.eOffsets.push_back((int32_t)out.ePins.size());
+				}
+				else
+				{
+					out.ePins.resize(base);
 				}
 			}
 			gProf.levelRebuildNs += gProf.nowNs() - tReb0;
@@ -692,10 +726,10 @@ namespace ymc
 			int64_t wA = levelWeight(l, 0);
 			int64_t wB = levelWeight(l, 1);
 			// per-edge pin counts per side
-			std::vector<int64_t> pinsA(l.e.size(), 0), pinsB(l.e.size(), 0);
-			for (size_t ei = 0; ei < l.e.size(); ei++)
-				for (int32_t p : l.e[ei].pins)
-					if (l.v[p].part == 0)
+			std::vector<int64_t> pinsA(l.eCount(), 0), pinsB(l.eCount(), 0);
+			for (size_t ei = 0; ei + 1 < l.eOffsets.size(); ei++)
+				for (int32_t pp = l.eOffsets[ei]; pp < l.eOffsets[ei + 1]; pp++)
+					if (l.v[l.ePins[pp]].part == 0)
 						pinsA[ei]++;
 					else
 						pinsB[ei]++;
@@ -704,13 +738,13 @@ namespace ymc
 			{
 				gProf.fmGainOfCalls++;
 				int64_t g = 0;
-				for (int32_t ei : l.inc[vid])
+				for (int32_t ip = l.incOffsets[vid]; ip < l.incOffsets[vid + 1]; ip++)
 				{
-					const auto &e = l.e[ei];
+					const int32_t ei = l.incList[ip];
 					bool sole = (l.v[vid].part == 0) ? (pinsA[ei] == 1) : (pinsB[ei] == 1);
 					bool other = (l.v[vid].part == 0) ? (pinsB[ei] >= 1) : (pinsA[ei] >= 1);
 					if (sole && other)
-						g += e.weight;
+						g += l.eWeight[ei];
 				}
 				return g;
 			};
@@ -778,9 +812,9 @@ namespace ymc
 					wB -= dw;
 					wA += dw;
 				}
-				for (int32_t ei : l.inc[v])
+				for (int32_t ip = l.incOffsets[v]; ip < l.incOffsets[v + 1]; ip++)
 				{
-					const auto &e = l.e[ei];
+					const int32_t ei = l.incList[ip];
 					if (from == 0)
 					{
 						pinsA[ei]--;
@@ -791,8 +825,9 @@ namespace ymc
 						pinsB[ei]--;
 						pinsA[ei]++;
 					}
-					for (int32_t p : e.pins)
+					for (int32_t pp = l.eOffsets[ei]; pp < l.eOffsets[ei + 1]; pp++)
 					{
+						const int32_t p = l.ePins[pp];
 						gProf.fmPinIters++;
 						if (p != v && !locked[p])
 						{
@@ -873,6 +908,7 @@ namespace ymc
 					v.part = -1;
 					l0.v.push_back(v);
 				}
+				l0.eOffsets.push_back(0);
 				for (const auto &pins0 : subsetEdges)
 				{
 					std::vector<int32_t> pins;
@@ -887,11 +923,10 @@ namespace ymc
 					pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
 					if (pins.size() >= 2)
 					{
-						HgEdge ne;
-						ne.id = (int32_t)l0.e.size();
-						ne.pins = pins;
-						ne.weight = 1;
-						l0.e.push_back(ne);
+						const int32_t base = (int32_t)l0.ePins.size();
+						l0.ePins.insert(l0.ePins.end(), pins.begin(), pins.end());
+						l0.eWeight.push_back(1);
+						l0.eOffsets.push_back((int32_t)l0.ePins.size());
 					}
 				}
 				gProf.tProjectNs += gProf.nowNs() - tProj0;
@@ -916,14 +951,14 @@ namespace ymc
 						if (v.weight > maxWl)
 							maxWl = v.weight;
 					int64_t pinsLv = 0;
-					for (const auto &e : levels.back().e)
-						pinsLv += (int64_t)e.pins.size();
+					for (size_t ei = 0; ei + 1 < levels.back().eOffsets.size(); ei++)
+						pinsLv += (int64_t)(levels.back().eOffsets[ei + 1] - levels.back().eOffsets[ei]);
 					ylog("[HG-PROF] level d=%d k=%d li=%zu vIn=%zu vOut=%zu e=%zu pins=%lld "
 						 "pairs=%lld singles=%lld ratio=%.6f maxW=%lld scanIts=%lld sortIts=%lld "
 						 "touchedPins=%lld rebuildE=%lld rebuildPins=%lld scanMs=%.3f sortMs=%.3f "
 						 "rebuildMs=%.3f reason=%s\n",
 						 depth, k, levels.size(), levels.back().v.size(), src.v.size(),
-						 levels.back().e.size(), (long long)pinsLv, (long long)gProf.levelPairs,
+						 levels.back().eCount(), (long long)pinsLv, (long long)gProf.levelPairs,
 						 (long long)gProf.levelSingles,
 						 src.v.size() ? (double)src.v.size() / levels.back().v.size() : 0.0,
 						 (long long)maxWl, (long long)gProf.levelScanIts,
@@ -971,7 +1006,7 @@ namespace ymc
 				if (gProf.on)
 					ylog("[HG-PROF] fm d=%d k=%d li=%d v=%zu e=%zu moves=%lld ms=%.3f "
 						 "gainOf=%lld pushes=%lld pops=%lld pinIters=%lld\n",
-						 depth, k, li, levels[li].v.size(), levels[li].e.size(),
+						 depth, k, li, levels[li].v.size(), levels[li].eCount(),
 						 (long long)fmMoves, (tF2 - tF1) / 1e6,
 						 (long long)gProf.fmGainOfCalls, (long long)gProf.fmHeapPushes,
 						 (long long)gProf.fmHeapPops, (long long)gProf.fmPinIters);
