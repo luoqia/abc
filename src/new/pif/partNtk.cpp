@@ -1,10 +1,13 @@
 #include "partNtk.h"
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/types.h>
 #include <unordered_map>
 #include <fcntl.h>
 #include <cstdio>
+#include <sys/stat.h>
 #include <linux/limits.h> // PATH_MAX
 #include <libgen.h>		  // dirname
 
@@ -12,6 +15,195 @@ using Clock = std::chrono::high_resolution_clock;
 
 namespace ymc
 {
+	// Task 16 Stage 3 behavior-neutral telemetry (child rows). Gated by
+	// PIF_TELEMETRY_DIR; no file is opened when the variable is unset.
+	namespace
+	{
+		const char *pifChildTelemetryDir()
+		{
+			static const char *d = getenv("PIF_TELEMETRY_DIR");
+			return (d && *d) ? d : nullptr;
+		}
+		void pifChildTelemetryRow(const char *name, const char *header, const char *row)
+		{
+			const char *d = pifChildTelemetryDir();
+			if (!d)
+				return;
+			static char path[PATH_MAX];
+			snprintf(path, sizeof(path), "%s/%s", d, name);
+			FILE *f = fopen(path, "a");
+			if (!f)
+				return;
+			if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0)
+				fprintf(f, "%s\n", header);
+			fprintf(f, "%s\n", row);
+			fclose(f);
+		}
+	} // anonymous namespace
+
+	int pifResolveEffectiveJ(int explicitJ)
+	{
+		if (explicitJ > 0)
+			return explicitJ;
+		int allowed = 0;
+#if defined(__linux__)
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		if (sched_getaffinity(0, sizeof(set), &set) == 0)
+			allowed = CPU_COUNT(&set);
+#endif
+		if (allowed < 1)
+			allowed = (int)std::thread::hardware_concurrency();
+		return std::max(1, allowed / 2);
+	}
+
+	// ---------------------------------------------------------------------------
+	// Path-independent result-type contract helpers.
+	// The merge path must never be chosen from the -S value (a file path in the
+	// project flow) or from any directory/filename substring. The primary
+	// classifier is the actual child network; the script CONTENT (read from the
+	// referenced file when readable) is used only for the fallback intent.
+	// ---------------------------------------------------------------------------
+
+	// Primary classifier: 1 if the loaded child network is a mapped result.
+	// A network is mapped when it carries Mio mapping data (ABC_FUNC_MAP) or
+	// when it contains LUT-width gates (nodes with more than 3 fanins, i.e.
+	// K4/K6 LUT truth tables read back from BLIF). AIG/SOP results from
+	// AIG-mode scripts have only 1-3-input gates and take the AIG form.
+	// This is a property of the actual child network, never of the -S value
+	// or any path string.
+	static bool IsMappedLogic(Abc_Ntk_t *pLogic)
+	{
+		if (!pLogic)
+			return false;
+		if (Abc_NtkHasMapping(pLogic))
+			return true;
+		Abc_Obj_t *pObj;
+		int i;
+		Abc_NtkForEachNode(pLogic, pObj, i)
+			if (Abc_ObjFaninNum(pObj) > 3)
+				return true;
+		return false;
+	}
+
+	// Read the -S value as content: file content when the value names a
+	// readable file, otherwise the inline value itself. Never the path string.
+	static std::string OptScriptContent(const std::string &value)
+	{
+		FILE *f = fopen(value.c_str(), "r");
+		if (!f)
+			return value;
+		std::string content;
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+			content.append(buf, n);
+		fclose(f);
+		return content;
+	}
+
+	// Content-based mapping intent: a 'map' or 'if' command token in the script
+	// content decides mapped intent; a dch-only script decides AIG intent.
+	static bool ScriptHasMappingCommand(const std::string &content)
+	{
+		size_t pos = 0;
+		while (pos <= content.size())
+		{
+			size_t semi = content.find(';', pos);
+			std::string cmd = content.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+			size_t b = cmd.find_first_not_of(" \t\r\n");
+			if (b != std::string::npos)
+			{
+				size_t e = cmd.find_first_of(" \t", b);
+				std::string tok = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+				if (tok == "map" || tok == "if")
+					return true;
+			}
+			if (semi == std::string::npos)
+				break;
+			pos = semi + 1;
+		}
+		return false;
+	}
+
+	// Flow mapping intent: explicit -m fpga/asic, else the read script content.
+	static bool FlowIntendsMapped(const std::string &mapType, const std::string &optScript)
+	{
+		if (mapType == "fpga" || mapType == "asic")
+			return true;
+		return ScriptHasMappingCommand(OptScriptContent(optScript));
+	}
+
+	// Normalize a stored child to the AIG form: a STRASH network that the AIG
+	// merge (Abc_NtkMerge) can process. Takes ownership of pNtk on success.
+	static Abc_Ntk_t *ToAigForm(Abc_Ntk_t *pNtk)
+	{
+		if (!pNtk)
+			return nullptr;
+		if (Abc_NtkIsStrash(pNtk))
+			return pNtk;
+		Abc_Ntk_t *pStrash = Abc_NtkStrash(pNtk, 0, 1, 0);
+		if (pStrash)
+		{
+			Abc_NtkDelete(pNtk);
+			return pStrash;
+		}
+		return pNtk;
+	}
+
+	// Compact SHA-256 (FIPS 180-4) for effective child-script identification.
+	static inline uint32_t Rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+	static std::string Sha256Hex(const std::string &data)
+	{
+		static const uint32_t K[64] = {
+			0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+			0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+			0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+			0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+			0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+			0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+			0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+			0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+		uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+		uint64_t len = data.size();
+		std::string msg = data;
+		msg += (char)0x80;
+		while (msg.size() % 64 != 56)
+			msg += (char)0;
+		for (int i = 7; i >= 0; i--)
+			msg += (char)((len * 8) >> (i * 8));
+		for (size_t off = 0; off < msg.size(); off += 64)
+		{
+			uint32_t w[64];
+			for (int i = 0; i < 16; i++)
+				w[i] = ((uint32_t)(unsigned char)msg[off+i*4] << 24) |
+					   ((uint32_t)(unsigned char)msg[off+i*4+1] << 16) |
+					   ((uint32_t)(unsigned char)msg[off+i*4+2] << 8) |
+					   (uint32_t)(unsigned char)msg[off+i*4+3];
+			for (int i = 16; i < 64; i++)
+			{
+				uint32_t s0 = Rotr(w[i-15], 7) ^ Rotr(w[i-15], 18) ^ (w[i-15] >> 3);
+				uint32_t s1 = Rotr(w[i-2], 17) ^ Rotr(w[i-2], 19) ^ (w[i-2] >> 10);
+				w[i] = w[i-16] + s0 + w[i-7] + s1;
+			}
+			uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+			for (int i = 0; i < 64; i++)
+			{
+				uint32_t S1 = Rotr(e,6) ^ Rotr(e,11) ^ Rotr(e,25);
+				uint32_t ch = (e & f) ^ (~e & g);
+				uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+				uint32_t S0 = Rotr(a,2) ^ Rotr(a,13) ^ Rotr(a,22);
+				uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+				uint32_t t2 = S0 + maj;
+				hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+			}
+			h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+		}
+		char hex[65];
+		for (int i = 0; i < 8; i++)
+			snprintf(hex + i*8, 9, "%08x", h[i]);
+		return std::string(hex, 64);
+	}
 
 	PartNtk::~PartNtk()
 	{
@@ -101,6 +293,51 @@ namespace ymc
 				m_optScript = "strash; dc2; fraig; resyn2; if -K 6 -C 8";
 		}
 
+		// === -S script resolution: file mode vs inline mode ===
+		// The project passes the per-child script through a file path. When
+		// the value names a readable regular file, load its exact content as
+		// the child command text; otherwise the value is inline command text
+		// embedded verbatim. File-mode failures (unreadable or empty) are
+		// rejected through the existing pipeline-failure contract.
+		if (!m_optScript.empty())
+		{
+			struct stat st;
+			if (stat(m_optScript.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+			{
+				FILE *scriptFile = fopen(m_optScript.c_str(), "r");
+				if (!scriptFile)
+				{
+					ylog("[Error] -S file mode: cannot open %s\n", m_optScript.c_str());
+					m_fPipelineFailed = true;
+				}
+				else
+				{
+					std::string scriptText;
+					char buffer[4096];
+					size_t n;
+					while ((n = fread(buffer, 1, sizeof(buffer), scriptFile)) > 0)
+						scriptText.append(buffer, n);
+					fclose(scriptFile);
+					if (scriptText.empty())
+					{
+						ylog("[Error] -S file mode: script file %s is empty\n", m_optScript.c_str());
+						m_fPipelineFailed = true;
+					}
+					else
+					{
+						ylog("[PIF-SCRIPT] -S file mode: %s\n", m_optScript.c_str());
+						m_optScript = scriptText;
+						ylog("[PIF-SCRIPT] effective child script sha256: %s\n", Sha256Hex(m_optScript).c_str());
+					}
+				}
+			}
+			else
+			{
+				ylog("[PIF-SCRIPT] -S inline mode\n");
+				ylog("[PIF-SCRIPT] effective child script sha256: %s\n", Sha256Hex(m_optScript).c_str());
+			}
+		}
+
 		// === ASIC 映射校验 ===
 		if (m_mapType == "asic" && m_libPath.empty())
 		{
@@ -117,10 +354,19 @@ namespace ymc
 			}
 		}
 
+		if (m_tmpDir != "/dev/shm")
+			mkdir(m_tmpDir.c_str(), 0755);
+
 		ylog("ABC binary: %s\n", m_abcBin.c_str());
 		ylog("ABC RC:     %s\n", m_abcRc.c_str());
 		ylog("Opt script: %s\n", m_optScript.c_str());
 		ylog("Map type:   %s\n", m_mapType.c_str());
+		if (m_nMaxConcurrent > 0)
+			ylog("Concurrency cap: %d (explicit -j)\n", m_nMaxConcurrent);
+		else
+			ylog("Concurrency cap: default (allowed CPUs / 2 = %d)\n", m_effectiveJ);
+		ylog("Task tmp dir:    %s\n", m_tmpDir.c_str());
+		ylog("Strict mode:     %s\n", m_fStrict ? "on" : "off");
 		if (!m_libPath.empty())
 			ylog("Lib path:   %s\n", m_libPath.c_str());
 
@@ -141,6 +387,15 @@ namespace ymc
 
 		// Phase 2: Parallel Optimization + Mapping (Process-based)
 		optimizeSubNtks();
+
+		if (m_fPipelineFailed)
+		{
+			m_pMappedNtk = NULL;
+			auto end_flow = Clock::now();
+			m_stats.timeTotal = std::chrono::duration<double>(end_flow - start_flow).count();
+			printTimeStats();
+			return;
+		}
 
 		// Phase 3: Align & Merge
 		alignInterfaces();
@@ -169,7 +424,7 @@ namespace ymc
 
 		if (m_useMffc)
 		{
-			aig.parseAigMffc(m_nParts);
+			aig.parseAigMffc(m_nParts, m_effectiveJ);
 			m_nParts = aig.partitionAigMffc();
 		}
 		else
@@ -181,6 +436,42 @@ namespace ymc
 		ylog(" -> Adaptive nParts = %d\n", m_nParts);
 		init();
 		graph.createSubNtksFromPartition(m_vSubNtks);
+
+		// Task 17 Stage 2: emitted child PI/PO/interface census
+		// (behavior-neutral telemetry; gated by PIF_TELEMETRY_DIR).
+		if (pifTelemetryDir())
+		{
+			Abc_Obj_t *pObj;
+			int k;
+			for (size_t ci = 0; ci < m_vSubNtks.size(); ci++)
+			{
+				Abc_Ntk_t *pNtk = m_vSubNtks[ci];
+				int nPi = 0, nPo = 0, nIfPi = 0, nIfPo = 0;
+				Abc_NtkForEachPi(pNtk, pObj, k)
+				{
+					nPi++;
+					if (pObj->fMarkA)
+						nIfPi++;
+				}
+				Abc_NtkForEachPo(pNtk, pObj, k)
+				{
+					nPo++;
+					if (pObj->fMarkA)
+						nIfPo++;
+				}
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%zu\t%d\t%d\t%d\t%d\t%d",
+						 ci, Abc_NtkNodeNum(pNtk), nPi, nPo, nIfPi, nIfPo);
+				pifTelemetryRow("pif_subntk.tsv",
+								"childIdx\tnInternalNodes\tnPi\tnPo\tnInterfacePi\tnInterfacePo",
+								buf);
+			}
+		}
+
+		// Telemetry: per-child predicted workload in child index order.
+		m_vSubNtkPredWorkload = aig.getPartitionWorkloads();
+		if (m_vSubNtkPredWorkload.size() != m_vSubNtks.size())
+			m_vSubNtkPredWorkload.assign(m_vSubNtks.size(), -1);
 
 		auto end = Clock::now();
 		m_stats.timePartition = std::chrono::duration<double>(end - start).count();
@@ -349,16 +640,15 @@ namespace ymc
 		m_vSubNtksOptimized.resize(nTasks, nullptr);
 		m_stats.timeSubNtksOpt.resize(nTasks);
 
-		int max_concurrent = std::thread::hardware_concurrency() / 2;
-		if (max_concurrent < 1)
-			max_concurrent = 1;
+		int max_concurrent = m_effectiveJ;
 
 		int running_procs = 0;
 		pid_t my_pid = getpid();
 		std::unordered_map<pid_t, int> pid_to_idx;
+		std::unordered_map<pid_t, long> pid_to_parent_rss;
 		std::unordered_map<int, std::chrono::time_point<Clock>> task_start_times;
 
-		auto reap_process = [&](pid_t pid, int status)
+		auto reap_process = [&](pid_t pid, int status, const struct rusage &ru)
 		{
 			if (pid_to_idx.count(pid))
 			{
@@ -366,25 +656,23 @@ namespace ymc
 				auto end = Clock::now();
 				m_stats.timeSubNtksOpt[idx] = std::chrono::duration<double>(end - task_start_times[idx]).count();
 
-				if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+				bool fChildOk = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+				int nExitStatus = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+				int nSignal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+				bool fReadOk = false;
+				if (fChildOk)
 				{
 					char file_out[256];
-					snprintf(file_out, sizeof(file_out), "/dev/shm/pif_sub_%d_pid%d_opt.blif", idx, my_pid);
+					snprintf(file_out, sizeof(file_out), "%s/pif_sub_%d_pid%d_opt.blif", m_tmpDir.c_str(), idx, my_pid);
 
 					Abc_Ntk_t *pNetlist = Io_ReadBlif(file_out, 1);
+					fReadOk = (pNetlist != NULL);
 					if (pNetlist)
 					{
-						// 根据用户脚本判断是否包含映射命令
+						// 分类依据是实际子网网络, 与 -S 值/路径/文件名无关
 						bool isMappedResult = false;
-						if (m_mapType == "fpga" || m_mapType == "asic")
-							isMappedResult = true;
-						else if (m_mapType.empty())
-							isMappedResult = (m_optScript.find("map") != std::string::npos) ||
-											 (m_optScript.find("if ") != std::string::npos) ||
-											 (m_optScript.find("if;") != std::string::npos) ||
-											 (m_optScript.find("if -") != std::string::npos);
-
 						Abc_Ntk_t *pLogic = Abc_NtkToLogic(pNetlist);
+						isMappedResult = IsMappedLogic(pLogic);
 						Abc_NtkDelete(pNetlist);
 
 						if (pLogic)
@@ -405,11 +693,63 @@ namespace ymc
 					// 清理临时文件
 					remove(file_out);
 					char file_in[256];
-					snprintf(file_in, sizeof(file_in), "/dev/shm/pif_sub_%d_pid%d.blif", idx, my_pid);
+					snprintf(file_in, sizeof(file_in), "%s/pif_sub_%d_pid%d.blif", m_tmpDir.c_str(), idx, my_pid);
 					remove(file_in);
 				}
+				double dElapsed = m_stats.timeSubNtksOpt[idx];
+				int nNodes = Abc_NtkNodeNum(m_vSubNtks[idx]);
+				m_dChildElapsedSum += dElapsed;
+				if (dElapsed > m_dChildElapsedMax)
+					m_dChildElapsedMax = dElapsed;
+
+				// Telemetry: per-child row (elapsed, CPU, RSS, outcome,
+				// before/after nodes and levels, predicted workload).
+				{
+					double cpuSec = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 +
+									(double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+					Abc_Ntk_t *pRes = m_vSubNtksOptimized[idx];
+					const char *resType = "failure";
+					if (pRes)
+						resType = Abc_NtkIsStrash(pRes) ? "aig" : "mapped";
+					if (pRes && !fChildOk)
+						resType = "fallback";
+					int64_t predWl = (idx < (int)m_vSubNtkPredWorkload.size()) ? m_vSubNtkPredWorkload[idx] : -1;
+					auto itRss = pid_to_parent_rss.find(pid);
+					long parentRssKB = (itRss != pid_to_parent_rss.end()) ? itRss->second : -1;
+					char buf[512];
+					snprintf(buf, sizeof(buf),
+							 "%d\t%lld\t%d\t%.6f\t%.6f\t%ld\t%ld\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%d",
+							 idx, (long long)predWl, nNodes, dElapsed, cpuSec,
+							 ru.ru_maxrss, parentRssKB, nExitStatus, nSignal, (int)fReadOk,
+							 (int)(!m_vSubNtksOptimized[idx]), resType,
+							 pRes ? Abc_NtkNodeNum(pRes) : 0,
+							 pRes ? Abc_NtkLevel(pRes) : 0,
+							 pRes ? Abc_NtkGetChoiceNum(pRes) : 0);
+					pifChildTelemetryRow("pif_child.tsv",
+										 "idx\tpredWorkload\tnNodesIn\telapsedS\tcpuS\trssKB\tparentRssKB\texit\tsig\tread\tfailed\tresultType\tnNodesOut\tlevOut\tchoicesOut",
+										 buf);
+				}
+
 				if (!m_vSubNtksOptimized[idx])
 				{
+					if (m_fStrict)
+					{
+						m_nChildFailure++;
+						m_fPipelineFailed = true;
+						ylog("[PIF-CHILD] idx=%d nodes=%d pid=%d start=%.4f end=%.4f elapsed=%.4f exit=%d sig=%d read=%d fallback=%d reason=strict_child_error\n",
+							 idx, nNodes, pid,
+							 std::chrono::duration<double>(task_start_times[idx] - start_total).count(),
+							 std::chrono::duration<double>(end - start_total).count(),
+							 dElapsed, nExitStatus, nSignal, (int)fReadOk, (int)false);
+						ylog("[PIF-STRICT] sub %d has no valid optimized result; failing pif per -e.\n", idx);
+						pid_to_idx.erase(pid);
+						return;
+					}
+					ylog("[PIF-CHILD] idx=%d nodes=%d pid=%d start=%.4f end=%.4f elapsed=%.4f exit=%d sig=%d read=%d fallback=%d reason=child_failed\n",
+						 idx, nNodes, pid,
+						 std::chrono::duration<double>(task_start_times[idx] - start_total).count(),
+						 std::chrono::duration<double>(end - start_total).count(),
+						 dElapsed, nExitStatus, nSignal, (int)fReadOk, (int)true);
 					printf("[Warn] Optimization failed/aborted for sub %d, using original.\n", idx);
 					Abc_Ntk_t *pDup = Abc_NtkDup(m_vSubNtks[idx]);
 
@@ -421,14 +761,8 @@ namespace ymc
 					}
 
 					// 映射模式下: 在父进程中执行映射, 保证产出 ABC_FUNC_MAP
-					bool isMappedFallback = false;
-					if (m_mapType == "fpga" || m_mapType == "asic")
-						isMappedFallback = true;
-					else if (m_mapType.empty())
-						isMappedFallback = (m_optScript.find("map") != std::string::npos) ||
-										   (m_optScript.find("if ") != std::string::npos) ||
-										   (m_optScript.find("if;") != std::string::npos) ||
-										   (m_optScript.find("if -") != std::string::npos);
+					// 意图判断: 显式 -m, 否则读取脚本内容(文件或内联)判断
+					bool isMappedFallback = FlowIntendsMapped(m_mapType, m_optScript);
 
 					if (isMappedFallback && pDup && !Abc_NtkHasMapping(pDup))
 					{
@@ -443,8 +777,8 @@ namespace ymc
 						if (pNetlist)
 						{
 							char tmpIn[256], tmpOut[256];
-							snprintf(tmpIn, sizeof(tmpIn), "/dev/shm/pif_fb_%d_pid%d.blif", idx, getpid());
-							snprintf(tmpOut, sizeof(tmpOut), "/dev/shm/pif_fb_%d_pid%d_opt.blif", idx, getpid());
+							snprintf(tmpIn, sizeof(tmpIn), "%s/pif_fb_%d_pid%d.blif", m_tmpDir.c_str(), idx, getpid());
+							snprintf(tmpOut, sizeof(tmpOut), "%s/pif_fb_%d_pid%d_opt.blif", m_tmpDir.c_str(), idx, getpid());
 
 							Io_WriteBlif(pNetlist, tmpIn, 1, 0, 0);
 							Abc_NtkDelete(pNetlist);
@@ -461,8 +795,7 @@ namespace ymc
 							char cmd[2048];
 							if (!m_libPath.empty())
 							{
-								if (m_mapType == "asic" ||
-									(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+								if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 									snprintf(cmd, sizeof(cmd),
 											 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 											 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn, tmpOut);
@@ -473,8 +806,7 @@ namespace ymc
 							}
 							else
 							{
-								if (m_mapType == "asic" ||
-									(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+								if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 									snprintf(cmd, sizeof(cmd),
 											 "source %s; read_blif %s; strash; map; write_blif %s",
 											 m_abcRc.c_str(), tmpIn, tmpOut);
@@ -525,36 +857,42 @@ namespace ymc
 						// 如果上面没成功, pDup 仍然有效
 						if (!m_vSubNtksOptimized[idx])
 						{
-							m_vSubNtksOptimized[idx] = pDup;
+							// 非映射意图: 存 STRASH, 保证 AIG 合并安全
+							m_vSubNtksOptimized[idx] = isMappedFallback ? pDup : ToAigForm(pDup);
 						}
 					}
 					else
 					{
-						m_vSubNtksOptimized[idx] = pDup;
+						m_vSubNtksOptimized[idx] = isMappedFallback ? pDup : ToAigForm(pDup);
 					}
+					m_nChildFallback++;
+				}
+				else
+				{
+					m_nChildOk++;
+					ylog("[PIF-CHILD] idx=%d nodes=%d pid=%d start=%.4f end=%.4f elapsed=%.4f exit=%d sig=%d read=%d fallback=%d reason=ok\n",
+						 idx, nNodes, pid,
+						 std::chrono::duration<double>(task_start_times[idx] - start_total).count(),
+						 std::chrono::duration<double>(end - start_total).count(),
+						 dElapsed, nExitStatus, nSignal, (int)fReadOk, (int)false);
 				}
 				pid_to_idx.erase(pid);
 			}
 		};
 
-		// 判断是否包含映射命令
-		bool isMappedFlow = false;
-		if (m_mapType == "fpga" || m_mapType == "asic")
-			isMappedFlow = true;
-		else if (m_mapType.empty())
-			isMappedFlow = (m_optScript.find("map") != std::string::npos) ||
-						   (m_optScript.find("if ") != std::string::npos) ||
-						   (m_optScript.find("if;") != std::string::npos) ||
-						   (m_optScript.find("if -") != std::string::npos);
+		// 意图判断: 显式 -m, 否则读取脚本内容(文件或内联)判断
+		bool isMappedFlow = FlowIntendsMapped(m_mapType, m_optScript);
 
 		for (int i = 0; i < nTasks; ++i)
 		{
 			// === 空子网: 无论什么模式都直接跳过 ===
 			if (Abc_NtkNodeNum(m_vSubNtks[i]) == 0)
 			{
-				// 空子网: 创建一个空的 logic 网络占位
+				// 空子网: 非映射意图存 STRASH, 映射意图存 logic
 				Abc_Ntk_t *pDup = Abc_NtkDup(m_vSubNtks[i]);
-				if (Abc_NtkIsStrash(pDup))
+				if (!isMappedFlow)
+					m_vSubNtksOptimized[i] = ToAigForm(pDup);
+				else if (Abc_NtkIsStrash(pDup))
 				{
 					Abc_Ntk_t *pLogic = Abc_NtkToLogic(pDup);
 					Abc_NtkDelete(pDup);
@@ -573,18 +911,9 @@ namespace ymc
 			{
 				if (!isMappedFlow)
 				{
-					// 非映射模式: 直接转 logic 即可
+					// 非映射模式: 保持 STRASH, AIG 合并需要 STRASH 子网
 					Abc_Ntk_t *pDup = Abc_NtkDup(m_vSubNtks[i]);
-					if (Abc_NtkIsStrash(pDup))
-					{
-						Abc_Ntk_t *pLogic = Abc_NtkToLogic(pDup);
-						Abc_NtkDelete(pDup);
-						m_vSubNtksOptimized[i] = pLogic;
-					}
-					else
-					{
-						m_vSubNtksOptimized[i] = pDup;
-					}
+					m_vSubNtksOptimized[i] = ToAigForm(pDup);
 				}
 				else
 				{
@@ -599,8 +928,8 @@ namespace ymc
 					}
 
 					char tmpIn[256], tmpOut[256];
-					snprintf(tmpIn, sizeof(tmpIn), "/dev/shm/pif_small_%d_pid%d.blif", i, getpid());
-					snprintf(tmpOut, sizeof(tmpOut), "/dev/shm/pif_small_%d_pid%d_opt.blif", i, getpid());
+					snprintf(tmpIn, sizeof(tmpIn), "%s/pif_small_%d_pid%d.blif", m_tmpDir.c_str(), i, getpid());
+					snprintf(tmpOut, sizeof(tmpOut), "%s/pif_small_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, getpid());
 
 					// 写出临时 blif (重定向 stdout 抑制 ABC 日志)
 					fflush(stdout);
@@ -630,8 +959,7 @@ namespace ymc
 					char cmd[2048];
 					if (!m_libPath.empty())
 					{
-						if (m_mapType == "asic" ||
-							(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+						if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 							snprintf(cmd, sizeof(cmd),
 									 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 									 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn, tmpOut);
@@ -642,8 +970,7 @@ namespace ymc
 					}
 					else
 					{
-						if (m_mapType == "asic" ||
-							(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+						if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 							snprintf(cmd, sizeof(cmd),
 									 "source %s; read_blif %s; strash; map; write_blif %s",
 									 m_abcRc.c_str(), tmpIn, tmpOut);
@@ -694,8 +1021,8 @@ namespace ymc
 									}
 									{
 										char tmpIn2[256], tmpOut2[256];
-										snprintf(tmpIn2, sizeof(tmpIn2), "/dev/shm/pif_small_fb_%d_pid%d.blif", i, getpid());
-										snprintf(tmpOut2, sizeof(tmpOut2), "/dev/shm/pif_small_fb_%d_pid%d_opt.blif", i, getpid());
+										snprintf(tmpIn2, sizeof(tmpIn2), "%s/pif_small_fb_%d_pid%d.blif", m_tmpDir.c_str(), i, getpid());
+										snprintf(tmpOut2, sizeof(tmpOut2), "%s/pif_small_fb_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, getpid());
 										fflush(stdout);
 										int orig_stdout_s2 = dup(STDOUT_FILENO);
 										int dev_null_s2 = open("/dev/null", O_WRONLY);
@@ -718,8 +1045,7 @@ namespace ymc
 										char cmd2[2048];
 										if (!m_libPath.empty())
 										{
-											if (m_mapType == "asic" ||
-												(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+											if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 												snprintf(cmd2, sizeof(cmd2),
 														 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 														 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn2, tmpOut2);
@@ -730,8 +1056,7 @@ namespace ymc
 										}
 										else
 										{
-											if (m_mapType == "asic" ||
-												(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+											if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 												snprintf(cmd2, sizeof(cmd2),
 														 "source %s; read_blif %s; strash; map; write_blif %s",
 														 m_abcRc.c_str(), tmpIn2, tmpOut2);
@@ -777,8 +1102,19 @@ namespace ymc
 									}
 									if (!m_vSubNtksOptimized[i])
 									{
-										m_vSubNtksOptimized[i] = pFB;
-										ylog("[Warn] Small sub %d mapping produced non-mapped result\n", i);
+										if (m_fStrict)
+										{
+											m_nChildFailure++;
+											m_fPipelineFailed = true;
+											ylog("[PIF-STRICT] small sub %d mapping produced a non-mapped result; failing pif per -e.\n", i);
+											if (pFB)
+												Abc_NtkDelete(pFB);
+										}
+										else
+										{
+											m_vSubNtksOptimized[i] = pFB;
+											ylog("[Warn] Small sub %d mapping produced non-mapped result\n", i);
+										}
 									}
 								}
 							}
@@ -794,8 +1130,8 @@ namespace ymc
 							}
 							{
 								char tmpIn2[256], tmpOut2[256];
-								snprintf(tmpIn2, sizeof(tmpIn2), "/dev/shm/pif_small_fb_%d_pid%d.blif", i, getpid());
-								snprintf(tmpOut2, sizeof(tmpOut2), "/dev/shm/pif_small_fb_%d_pid%d_opt.blif", i, getpid());
+								snprintf(tmpIn2, sizeof(tmpIn2), "%s/pif_small_fb_%d_pid%d.blif", m_tmpDir.c_str(), i, getpid());
+								snprintf(tmpOut2, sizeof(tmpOut2), "%s/pif_small_fb_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, getpid());
 								fflush(stdout);
 								int orig_stdout_s2 = dup(STDOUT_FILENO);
 								int dev_null_s2 = open("/dev/null", O_WRONLY);
@@ -818,8 +1154,7 @@ namespace ymc
 								char cmd2[2048];
 								if (!m_libPath.empty())
 								{
-									if (m_mapType == "asic" ||
-										(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+									if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 										snprintf(cmd2, sizeof(cmd2),
 												 "source %s; %s %s; read_blif %s; strash; map; write_blif %s",
 												 m_abcRc.c_str(), readLibCmd, m_libPath.c_str(), tmpIn2, tmpOut2);
@@ -830,8 +1165,7 @@ namespace ymc
 								}
 								else
 								{
-									if (m_mapType == "asic" ||
-										(m_mapType.empty() && m_optScript.find("map") != std::string::npos))
+									if (m_mapType == "asic" || ScriptHasMappingCommand(OptScriptContent(m_optScript)))
 										snprintf(cmd2, sizeof(cmd2),
 												 "source %s; read_blif %s; strash; map; write_blif %s",
 												 m_abcRc.c_str(), tmpIn2, tmpOut2);
@@ -877,8 +1211,19 @@ namespace ymc
 							}
 							if (!m_vSubNtksOptimized[i])
 							{
-								m_vSubNtksOptimized[i] = pFB;
-								ylog("[Warn] Small sub %d fork mapping failed\n", i);
+								if (m_fStrict)
+								{
+									m_nChildFailure++;
+									m_fPipelineFailed = true;
+									ylog("[PIF-STRICT] small sub %d fork mapping failed; failing pif per -e.\n", i);
+									if (pFB)
+										Abc_NtkDelete(pFB);
+								}
+								else
+								{
+									m_vSubNtksOptimized[i] = pFB;
+									ylog("[Warn] Small sub %d fork mapping failed\n", i);
+								}
 							}
 						}
 					}
@@ -889,22 +1234,25 @@ namespace ymc
 				continue;
 			}
 			// 大子网: 走 fork 子进程
+			if (m_fPipelineFailed)
+				break;
 
 			while (running_procs >= max_concurrent)
 			{
 				int status;
-				pid_t pid = wait(&status);
+				struct rusage ru;
+				pid_t pid = wait4(-1, &status, 0, &ru);
 				if (pid > 0)
 				{
-					reap_process(pid, status);
+					reap_process(pid, status, ru);
 					running_procs--;
 				}
 			}
 
 			task_start_times[i] = Clock::now();
 			char file_in[256], file_out[256];
-			snprintf(file_in, sizeof(file_in), "/dev/shm/pif_sub_%d_pid%d.blif", i, my_pid);
-			snprintf(file_out, sizeof(file_out), "/dev/shm/pif_sub_%d_pid%d_opt.blif", i, my_pid);
+			snprintf(file_in, sizeof(file_in), "%s/pif_sub_%d_pid%d.blif", m_tmpDir.c_str(), i, my_pid);
+			snprintf(file_out, sizeof(file_out), "%s/pif_sub_%d_pid%d_opt.blif", m_tmpDir.c_str(), i, my_pid);
 			remove(file_in);
 
 			// 重定向 stdout 到 /dev/null，抑制子进程产生的 ABC 日志
@@ -937,6 +1285,8 @@ namespace ymc
 			if (dev_null != -1)
 				close(dev_null);
 
+			struct rusage rufork;
+			getrusage(RUSAGE_SELF, &rufork);
 			pid_t pid = fork();
 			if (pid == 0)
 			{
@@ -967,6 +1317,7 @@ namespace ymc
 			else if (pid > 0)
 			{
 				pid_to_idx[pid] = i;
+				pid_to_parent_rss[pid] = rufork.ru_maxrss;
 				running_procs++;
 			}
 		}
@@ -974,16 +1325,20 @@ namespace ymc
 		while (running_procs > 0)
 		{
 			int status;
-			pid_t pid = wait(&status);
+			struct rusage ru;
+			pid_t pid = wait4(-1, &status, 0, &ru);
 			if (pid > 0)
 			{
-				reap_process(pid, status);
+				reap_process(pid, status, ru);
 				running_procs--;
 			}
 		}
 
 		auto end_total = Clock::now();
 		m_stats.timeOptTotal = std::chrono::duration<double>(end_total - start_total).count();
+		if (m_fPipelineFailed)
+			ylog("[PIF-STRICT] pif pipeline failed: ok=%d fallback=%d failure=%d\n",
+				 m_nChildOk, m_nChildFallback, m_nChildFailure);
 	}
 
 	void PartNtk::alignInterfaces()
@@ -1057,20 +1412,50 @@ namespace ymc
 
 	void PartNtk::mergeAndOutput()
 	{
-		// isMapped 判断（和第2处逻辑完全一样）：
-		bool isMapped = false;
-		if (m_mapType == "fpga" || m_mapType == "asic")
-			isMapped = true;
-		else if (m_mapType.empty())
-			isMapped = (m_optScript.find("map") != std::string::npos) ||
-					   (m_optScript.find("if ") != std::string::npos) ||
-					   (m_optScript.find("if;") != std::string::npos) ||
-					   (m_optScript.find("if -") != std::string::npos);
-
+		// 合并分派依据实际子网结果类型, 与 -S 值/路径无关
 		vector<Abc_Ntk_t *> &targetNtks = m_vSubNtksOptimized;
 
 		if (targetNtks.empty())
 			return;
+
+		// 实际子网形式决定合并函数: 全部 STRASH 走 AIG 合并;
+		// 含 logic(映射/SOP) 子网走 mapped 合并 (mapped 合并能处理
+		// Mio 与 SOP 子网, 且锚点指向子网对象, 不能在合并前释放/替换)。
+		// 混合类型仅可能出现在映射意图的回退子网, 默认策略用 mapped 合并,
+		// strict 模式失败。
+		bool fAnyLogic = false, fAnyStrash = false;
+		for (auto pNtk : targetNtks)
+		{
+			if (!pNtk)
+				continue;
+			if (Abc_NtkIsStrash(pNtk))
+				fAnyStrash = true;
+			else
+				fAnyLogic = true;
+		}
+		if (fAnyLogic && fAnyStrash && m_fStrict)
+		{
+			ylog("[PIF-STRICT] mixed mapped/AIG child results; failing pif per -e.\n");
+			m_nChildFailure++;
+			m_fPipelineFailed = true;
+			return;
+		}
+		if (fAnyLogic && fAnyStrash)
+		{
+			// 混合子网: mapped 合并无法安全处理 strash 子网 (节点 pData 为 NULL,
+			// Abc_NtkDupObj 的 Hop_Transfer 会解引用无效指针)。
+			// 默认策略: 全部转为 STRASH 走 AIG 合并 (函数保持, v3c 下游有 strash)。
+			// 转换替换了锚点指向的子网对象, 必须重新对齐接口。
+			ylog("[Warn] mixed mapped/AIG child results; converting all children to AIG for merge.\n");
+			for (auto &pNtk : targetNtks)
+			{
+				if (pNtk && !Abc_NtkIsStrash(pNtk))
+					pNtk = ToAigForm(pNtk);
+			}
+			alignInterfaces();
+			fAnyLogic = false;
+		}
+		bool isMapped = fAnyLogic;
 
 		ylog("Merging %s subnetworks (Structure-based)...\n", isMapped ? "mapped" : "optimized");
 
@@ -1169,10 +1554,11 @@ namespace ymc
 
 		// === 写文件 ===
 		char filename[256];
-		if (isMapped)
+		// 写形式跟随合并后网络的实际类型: STRASH -> AIG 文件, logic -> 映射文件
+		bool isMappedOut = Abc_NtkIsLogic(pMergedNtk);
+		if (isMappedOut)
 		{
-			bool isAsic = (m_mapType == "asic") ||
-						  (m_mapType.empty() && m_optScript.find("map") != std::string::npos);
+			bool isAsic = (m_mapType == "asic");
 
 			if (isAsic)
 			{
@@ -1307,6 +1693,15 @@ namespace ymc
 			printf("      * Processes:                %lu\n", m_stats.timeSubNtksOpt.size());
 			printf("      * Workload Stats (s):       Max=%.4f, Avg=%.4f, Sum=%.4f\n", max, avg, sum);
 			printf("      * Load Balance:             %.1f%% (Avg/Max)\n", calc_balance(avg, max));
+		}
+		printf("      * Child Outcomes:            ok=%d fallback=%d failure=%d\n",
+			   m_nChildOk, m_nChildFallback, m_nChildFailure);
+		printf("      * Child Elapsed (s):         Max=%.4f, Sum=%.4f\n",
+			   m_dChildElapsedMax, m_dChildElapsedSum);
+		{
+			double wall = m_stats.timeOptTotal > 1e-9 ? m_stats.timeOptTotal : 1.0;
+			printf("      * Effective Concurrency:    %.2f (sum_elapsed/phase_wall)\n",
+				   m_dChildElapsedSum / wall);
 		}
 		printf("      * Script: %s\n", m_optScript.c_str());
 		printf("----------------------------------------------------------\n");

@@ -8,14 +8,47 @@
 #include "aig/hop/hop.h"
 #include <sys/time.h>
 #include "yaig.h"
+#include "mffcHypergraph.h"
 #include <map>
 #include <utility>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <climits>
 
 ABC_NAMESPACE_USING_NAMESPACE
 
 namespace ymc
 {
+    // Behavior-neutral telemetry. All writes are gated by the
+    // PIF_TELEMETRY_DIR env var; when unset no file is opened or written
+    // and no selection semantics change. Rows are appended to per-topic
+    // TSV files under that directory. All counts use 64-bit accumulation.
+    inline const char *pifTelemetryDir()
+    {
+        static const char *d = getenv("PIF_TELEMETRY_DIR");
+        return (d && *d) ? d : nullptr;
+    }
+    inline FILE *pifTelemetryFile(const char *name)
+    {
+        const char *d = pifTelemetryDir();
+        if (!d)
+            return nullptr;
+        static char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", d, name);
+        return fopen(path, "a");
+    }
+    inline void pifTelemetryRow(const char *name, const char *header, const char *row)
+    {
+        FILE *f = pifTelemetryFile(name);
+        if (!f)
+            return;
+        if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == 0)
+            fprintf(f, "%s\n", header);
+        fprintf(f, "%s\n", row);
+        fclose(f);
+    }
+
     struct PartitionConfig
     {
         int32_t targetK = 0;
@@ -158,16 +191,33 @@ namespace ymc
         vector<int32_t> vClusterIds;
     };
 
+    // Task 19 Stage 3: effective child concurrency J, shared by the child
+    // scheduler and the adaptive K rule K=ceil(J/2). An explicit positive
+    // pif -j is authoritative; otherwise the allowed CPU count comes from
+    // Linux sched_getaffinity (cpuset/affinity aware) with a portable
+    // hardware-concurrency fallback; the default policy is half the allowed
+    // CPUs with a minimum of one. No memory query is made here; a
+    // memory-safe cap is supplied explicitly through pif -j.
+    int pifResolveEffectiveJ(int explicitJ);
+
     class MetisAig : public Yaig // for analysing the original NTK
     {
     public:
         MetisAig() : m_pMG(NULL) {};
         ~MetisAig() = default;
         void bindGraph(MetisGraph *pmg);
+        const std::vector<int64_t> &getPartitionWorkloads() const { return m_vPartitionWorkload; }
 
         void parseAig(int32_t userK = 0);
-        void parseAigMffc(int32_t userK = 0); // MFFC-based partition entry
+        void parseAigMffc(int32_t userK = 0, int32_t effectiveJ = 0); // MFFC-based partition entry; effectiveJ = shared effective child concurrency J
         int32_t partitionAigMffc();
+        // Task 17 Stage 2: behavior-neutral PartitionUnit/hypergraph
+        // telemetry over the control partition assignment.
+        void buildHypergraphTelemetry();
+        // Task 17 Stage 4: deterministic internal multilevel hypergraph
+        // partitioner; replaces the pairwise-adjacency greedy clustering.
+        void runHypergraphPartitioning(const PartitionConfig &config,
+                                       const vector<int32_t> &mffcWorkloads);
 
         // --- Legacy Cone-based methods ---
         void visitAllFaninFromNode(int32_t nodeId, Cone &cone);
@@ -221,6 +271,11 @@ namespace ymc
         int64_t m_iTotalWorkLoad;
         int64_t m_iMaxClusterWorkLoad;
 
+        // Task 16 Stage 3 telemetry: per-partition predicted workload in
+        // graph partition order (filled by partitionAigMffc/partitionAig;
+        // read only by telemetry, never by selection code).
+        std::vector<int64_t> m_vPartitionWorkload;
+
         vector<int> m_vConeId2ClusterId;
 
         // ============================================================
@@ -232,6 +287,15 @@ namespace ymc
         bool m_useMffc = false;          // flag: using MFFC or legacy Cone
         int32_t m_forceK = 0;            // non-zero: user requests exactly K partitions
 
+        // Task 17 Stage 2 telemetry state: per post-preprocessing unit,
+        // the strict (pre-merge) MFFC ids it contains and whether it is a
+        // split fragment. Read by telemetry only; never by selection code.
+        vector<vector<int32_t>> m_vUnitOrigins;
+        vector<bool> m_vUnitSplit;
+        // cluster id -> final partition id, captured in partitionAigMffc.
+        vector<int32_t> m_vCluster2PartitionId;
+        MffcHypergraph m_hg;
+
         // MFFC identification
         void identifyMffcs(); // identify all MFFCs in the Yaig
         int32_t computeMffcSize_rec(int32_t nodeId, vector<int32_t> &vMffcNodes);
@@ -240,12 +304,13 @@ namespace ymc
 
         // MFFC-based clustering (mirrors Cone-based but uses MffcUnit)
         void preprocessMffcs(vector<int32_t> &outMffcWorkloads);
-        PartitionConfig determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK);
+        PartitionConfig determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK, int32_t effectiveJ = 0);
         int32_t computeAdaptiveMffcTargetK(const vector<int32_t> &mffcWorkloads);
         void runMffcClusteringAlgorithm(const PartitionConfig &config, const vector<int32_t> &mffcWorkloads);
         int findBestClusterForMffc(int mffcIdx, const PartitionConfig &config,
                                    const vector<int> &mffcId2ClusterId,
-                                   const vector<int32_t> &mffcWorkloads);
+                                   const vector<int32_t> &mffcWorkloads,
+                                   double *pOutScore = nullptr);
         void assignOrphanMffc(int mffcIdx, vector<int> &mffcId2ClusterId,
                               const vector<int32_t> &mffcWorkloads);
         void postProcessMffcClusters();

@@ -161,8 +161,18 @@ Abc_Ntk_t * Abc_NtkIf( Abc_Ntk_t * pNtk, If_Par_t * pPars )
             If_DsdManAllocIsops( pIfMan->pIfDsdMan, pPars->nLutSize );
     }
 
+    if ( pPars->fParMap && !If_ManParPrecheck( pIfMan ) )
+    {
+        If_ManStop( pIfMan );
+        return NULL;
+    }
     // perform FPGA mapping
     if ( !If_ManPerformMapping( pIfMan ) )
+    {
+        If_ManStop( pIfMan );
+        return NULL;
+    }
+    if ( pPars->fParMap && pIfMan->pParMeta && !If_ManParPostcheck( pIfMan ) )
     {
         If_ManStop( pIfMan );
         return NULL;

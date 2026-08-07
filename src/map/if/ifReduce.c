@@ -9,7 +9,7 @@
   Synopsis    [Incremental improvement of current mapping.]
 
   Author      [Alan Mishchenko]
-  
+
   Affiliation [UC Berkeley]
 
   Date        [Ver. 1.0. Started - November 21, 2006.]
@@ -42,28 +42,47 @@ static void If_ManImproveNodeFaninCompact( If_Man_t * p, If_Obj_t * pObj, int nL
   Synopsis    [Improves current mapping using expand/Expand of one cut.]
 
   Description [Assumes current mapping assigned and required times computed.]
-               
+
   SideEffects []
 
   SeeAlso     []
 
 ***********************************************************************/
-void If_ManImproveMapping( If_Man_t * p )
+int If_ManImproveMapping( If_Man_t * p )
 {
-    abctime clk;
+    abctime clk, clkRequired, TimeExpand, TimeRequired;
+    int fParHandled = 0;
 
     clk = Abc_Clock();
-    If_ManImproveExpand( p, p->pPars->nLutSize );
-    If_ManComputeRequired( p );
+    if ( !If_ManParImproveMapping( p, &fParHandled ) )
+        return 0;
+    if ( !fParHandled )
+        If_ManImproveExpand( p, p->pPars->nLutSize );
+    TimeExpand = Abc_Clock() - clk;
+    clkRequired = Abc_Clock();
+    {
+        int fReqParHandled = 0;
+        if ( fParHandled && !If_ManParComputeRequiredStage9( p, IF_PAR_REQUIRED_SOURCE_IMPROVE, -1, &fReqParHandled, NULL ) )
+            return 0;
+        if ( !fReqParHandled && !If_ManComputeRequired( p ) )
+            return 0;
+    }
+    TimeRequired = Abc_Clock() - clkRequired;
+    p->Stage0Time.improve_expand_time += TimeExpand;
+    p->Stage0Time.improve_required_time += TimeRequired;
+    p->Stage0Time.required_time_total += TimeRequired;
+    p->Stage0Time.nImproves++;
     if ( p->pPars->fVerbose )
     {
-        Abc_Print( 1, "E:  Del = %7.2f.  Ar = %9.1f.  Edge = %8d.  ", 
+        Abc_Print( 1, "E:  Del = %7.2f.  Ar = %9.1f.  Edge = %8d.  ",
             p->RequiredGlo, p->AreaGlo, p->nNets );
         if ( p->dPower )
         Abc_Print( 1, "Switch = %7.2f.  ", p->dPower );
         Abc_Print( 1, "Cut = %8d.  ", p->nCutsMerged );
         Abc_PrintTime( 1, "T", Abc_Clock() - clk );
+        If_ManStage0TimePrintImprove( p, TimeExpand, TimeRequired );
     }
+    return 1;
 }
 
 /**Function*************************************************************
@@ -71,7 +90,7 @@ void If_ManImproveMapping( If_Man_t * p )
   Synopsis    [Performs area recovery for each node.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -82,9 +101,9 @@ void If_ManImproveExpand( If_Man_t * p, int nLimit )
     Vec_Ptr_t * vFront, * vFrontOld, * vVisited;
     If_Obj_t * pObj;
     int i;
-    vFront    = Vec_PtrAlloc( nLimit );
-    vFrontOld = Vec_PtrAlloc( nLimit );
-    vVisited  = Vec_PtrAlloc( 100 );
+    vFront    = Vec_PtrAlloc( nLimit ); //当前 frontier（优化后的叶子集合）
+    vFrontOld = Vec_PtrAlloc( nLimit ); //原始 frontier（用于回滚）
+    vVisited  = Vec_PtrAlloc( 100 );    //访问过的节点（用于清理 fMark）
     // iterate through all nodes in the topological order
     If_ManForEachNode( p, pObj, i )
         If_ManImproveNodeExpand( p, pObj, nLimit, vFront, vFrontOld, vVisited );
@@ -98,7 +117,7 @@ void If_ManImproveExpand( If_Man_t * p, int nLimit )
   Synopsis    [Counts the number of nodes with no external fanout.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -119,7 +138,7 @@ int If_ManImproveCutCost( If_Man_t * p, Vec_Ptr_t * vFront )
   Synopsis    [Performs area recovery for each node.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -135,15 +154,18 @@ void If_ManImproveNodeExpand( If_Man_t * p, If_Obj_t * pObj, int nLimit, Vec_Ptr
     pCut->Delay = If_CutDelay( p, pObj, pCut );
     assert( pCut->Delay <= pObj->Required + p->fEpsilon );
     if ( pObj->nRefs == 0 )
-        return;
+        return; //如果当前 cut 没有被映射用到，则不优化
     // get the delay
     DelayOld = pCut->Delay;
     // get the area
-    AreaBef = If_CutAreaRefed( p, pCut );
+    AreaBef = If_CutAreaRefed( p, pCut );   //记录优化前的面积
 //    if ( AreaBef == 1 )
 //        return;
     // the cut is non-trivial
+    //这个函数把 best cut 的叶子放入 vFront 和 vFrontOld，然后从 pObj 向下递归标记 fMark=1 直到叶子为止。
+    //fMark 标记的是 pObj 到叶子之间的 cone 以及叶子本身，用于区分"cone 内"和"cone 外"
     If_ManImproveNodePrepare( p, pObj, nLimit, vFront, vFrontOld, vVisited );
+
     // iteratively modify the cut
     If_CutAreaDeref( p, pCut );
     CostBef = If_ManImproveCutCost( p, vFront );
@@ -173,7 +195,7 @@ void If_ManImproveNodeExpand( If_Man_t * p, If_Obj_t * pObj, int nLimit, Vec_Ptr
   Synopsis    [Performs area recovery for each node.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -195,7 +217,7 @@ void If_ManImproveMark_rec( If_Man_t * p, If_Obj_t * pObj, Vec_Ptr_t * vVisited 
   Synopsis    [Prepares node mapping.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -227,7 +249,7 @@ void If_ManImproveNodePrepare( If_Man_t * p, If_Obj_t * pObj, int nLimit, Vec_Pt
   Synopsis    [Updates the frontier.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -257,7 +279,7 @@ void If_ManImproveNodeUpdate( If_Man_t * p, If_Obj_t * pObj, Vec_Ptr_t * vFront 
   Synopsis    [Returns 1 if the number of fanins will grow.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -277,7 +299,7 @@ int If_ManImproveNodeWillGrow( If_Man_t * p, If_Obj_t * pObj )
   Synopsis    [Returns the increase in the number of fanins with no external refs.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -304,7 +326,7 @@ int If_ManImproveNodeFaninCost( If_Man_t * p, If_Obj_t * pObj )
   Synopsis    [Updates the frontier.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -336,7 +358,7 @@ void If_ManImproveNodeFaninUpdate( If_Man_t * p, If_Obj_t * pObj, Vec_Ptr_t * vF
   Synopsis    [Compacts the number of external refs.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -366,7 +388,7 @@ int If_ManImproveNodeFaninCompact0( If_Man_t * p, If_Obj_t * pObj, int nLimit, V
   Synopsis    [Compacts the number of external refs.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -394,7 +416,7 @@ int If_ManImproveNodeFaninCompact1( If_Man_t * p, If_Obj_t * pObj, int nLimit, V
   Synopsis    [Compacts the number of external refs.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -422,7 +444,7 @@ int If_ManImproveNodeFaninCompact2( If_Man_t * p, If_Obj_t * pObj, int nLimit, V
   Synopsis    [Compacts the number of external refs.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -445,7 +467,7 @@ int If_ManImproveNodeFaninCompact_int( If_Man_t * p, If_Obj_t * pObj, int nLimit
   Synopsis    [Compacts the number of external refs.]
 
   Description []
-               
+
   SideEffects []
 
   SeeAlso     []
@@ -463,4 +485,3 @@ void If_ManImproveNodeFaninCompact( If_Man_t * p, If_Obj_t * pObj, int nLimit, V
 
 
 ABC_NAMESPACE_IMPL_END
-

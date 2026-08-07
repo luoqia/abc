@@ -3,9 +3,12 @@
 #include <climits>
 #include <unordered_map>
 #include <string>
+#include <cstdio>
+#include <sys/types.h>
 
 namespace ymc
 {
+
 	MetisGraph::MetisGraph(Abc_Ntk_t *pNtk, bool fMetis)
 	{
 		yassert(Abc_NtkIsStrash(pNtk) && Abc_NtkHasAig(pNtk));
@@ -409,6 +412,21 @@ namespace ymc
 		int nCutEdgeFromPi = 0;
 		int nCutEdge = 0;
 
+		// Task 17 Stage 2 ground truth: per signal, the producer/owner part
+		// and the deduped set of consumer parts that actually received an
+		// interface PI/PO in the emitted child networks. Read only by the
+		// telemetry hook below; never affects selection.
+		std::map<int32_t, std::pair<int32_t, std::set<int32_t>>> signalCuts;
+		auto recordCut = [&](int32_t signalNodeId, int32_t consumerPart)
+		{
+			if (!pifTelemetryDir())
+				return;
+			auto &rec = signalCuts[signalNodeId];
+			if (rec.second.empty())
+				rec.first = m_vPartition[signalNodeId];
+			rec.second.insert(consumerPart);
+		};
+
 		for (i = 0; i < vSubNtks.size(); i++)
 		{
 			vSubNtks[i] = initOneSubNtk(i);
@@ -439,6 +457,7 @@ namespace ymc
 			if (ipart0 != ipart) // cut edge found!
 			{
 				nCutEdge++;
+				recordCut(iFanin0, ipart);
 				if (Abc_ObjIsPi(pFanin0)) // when the Ci has a fanout edge that is cut, don't generate cut-caused PO
 				{
 					nCutEdgeFromPi++;
@@ -515,6 +534,7 @@ namespace ymc
 				if (ipart1 != ipart)
 				{
 					nCutEdge++;
+					recordCut(iFanin1, ipart);
 					if (Abc_ObjIsPi(pFanin1)) // when the Ci has a fanout edge that is cut, don't generate cut-caused PO
 					{
 						nCutEdgeFromPi++;
@@ -581,6 +601,37 @@ namespace ymc
 
 		ylog("Total number of CIs with cut fanout edges: %d\n", nCutEdgeFromPi);
 		ylog("Total number of cut edges: %d\n", nCutEdge);
+
+		// Task 17 Stage 2: emit the node-level interface ground truth.
+		if (pifTelemetryDir())
+		{
+			char buf[512];
+			for (const auto &kv : signalCuts)
+			{
+				int32_t sig = kv.first;
+				const char *type = "const";
+				if (sig >= 0 && sig < (int32_t)m_vpObjs.size() && m_vpObjs[sig])
+				{
+					if (Abc_ObjIsNode(m_vpObjs[sig]))
+						type = "internal";
+					else if (Abc_ObjIsPi(m_vpObjs[sig]))
+						type = "pi";
+				}
+				std::string parts;
+				for (int32_t p : kv.second.second)
+				{
+					if (!parts.empty())
+						parts += ",";
+					parts += std::to_string(p);
+				}
+				snprintf(buf, sizeof(buf), "%d\t%s\t%d\t%s\t%zu",
+						 sig, type, (int)kv.second.first,
+						 parts.c_str(), kv.second.second.size());
+				pifTelemetryRow("pif_signal_cut.tsv",
+								"signalNodeId\ttype\tproducerPart\tconsumerParts\tnConsumerParts",
+								buf);
+			}
+		}
 
 		return 0;
 	}
@@ -697,7 +748,7 @@ namespace ymc
 		for (int i = 0; i < m_vClusters.size(); i++)
 			// std::min(10, m_vClusters.size())
 			ylog("cluster[%d]: workload = %d\tiMaxLevel = %d\tnNodes = %d\tnCones = %ld\n", i, m_vClusters[i].iWorkload, m_vClusters[i].iMaxLevel, m_vClusters[i].nNodes, m_vClusters[i].vConeIds.size());
-#if 0 
+#if 0
 	for(auto& c : m_vClusters)
 	{
 		if(c.vConeIds.size())
@@ -2440,7 +2491,7 @@ namespace ymc
 					ylog("cone[%d]: edge: node[%d]->node[%d]\n", cone.iId, fanin.id, fanout.id);
 					m_tmp0++;
 				}
-				
+
 				fCut = 0;
 				break;
 			}
@@ -2812,8 +2863,10 @@ namespace ymc
 		// 1. 创建一个普通的新节点
 		Abc_Obj_t *pNode = Abc_NtkCreateNode(pNtk);
 
-		// 2. 如果有工艺库，赋予它 Const0 门的数据
-		if (pNtk->pManFunc)
+		// 2. 如果有工艺库(Mapping 网络)，赋予它 Const0 门的数据。
+		//    仅当网络是 ABC_FUNC_MAP 时 pManFunc 才是 Mio_Library；
+		//    对 AIG/SOP 网络 pManFunc 是 Hop_Man_t/Mem_Flex_t，强制转换会越界读
+		if (pNtk->pManFunc && Abc_NtkHasMapping(pNtk))
 		{
 			Mio_Library_t *pLib = (Mio_Library_t *)pNtk->pManFunc;
 			Mio_Gate_t *pGateC0 = Mio_LibraryReadConst0(pLib);
@@ -2838,8 +2891,10 @@ namespace ymc
 		// 1. 创建一个普通的新节点 (ABC_OBJ_NODE)
 		Abc_Obj_t *pNode = Abc_NtkCreateNode(pNtk);
 
-		// 2. 如果有工艺库，赋予它 Const1 门的数据
-		if (pNtk->pManFunc)
+		// 2. 如果有工艺库(Mapping 网络)，赋予它 Const1 门的数据。
+		//    仅当网络是 ABC_FUNC_MAP 时 pManFunc 才是 Mio_Library；
+		//    对 AIG/SOP 网络 pManFunc 是 Hop_Man_t/Mem_Flex_t，强制转换会越界读
+		if (pNtk->pManFunc && Abc_NtkHasMapping(pNtk))
 		{
 			Mio_Library_t *pLib = (Mio_Library_t *)pNtk->pManFunc;
 			Mio_Gate_t *pGateC1 = Mio_LibraryReadConst1(pLib);
@@ -3544,6 +3599,29 @@ namespace ymc
 		identifyMffcs();
 		computeMffcAdjacency();
 
+		// Task 17 Stage 2: track strict (pre-merge) MFFC origins through
+		// coalescing and splitting so every post-preprocessing unit can be
+		// labeled with its origin set and split-fragment flag. Telemetry
+		// state only; it never affects selection semantics.
+		m_vUnitOrigins.assign(m_vMffcs.size(), {});
+		m_vUnitSplit.assign(m_vMffcs.size(), false);
+		for (size_t i = 0; i < m_vMffcs.size(); i++)
+			m_vUnitOrigins[i].push_back((int32_t)i);
+
+		// Telemetry: original (pre-coalescing) MFFC table.
+		{
+			char buf[256];
+			for (size_t i = 0; i < m_vMffcs.size(); i++)
+			{
+				const MffcUnit &m = m_vMffcs[i];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%zu",
+						 m.iId, m.iRootId, (int)m.nNodes, (int)m.iMaxLevel,
+						 m.sAdjacentMffcId.size());
+				pifTelemetryRow("pif_mffc_orig.tsv",
+								"mffcIdx\trootId\tnNodes\tiMaxLevel\tadjCount", buf);
+			}
+		}
+
 		// ============================================================
 		// Pre-merge: coalesce tiny MFFCs along fanin chains
 		//
@@ -3629,6 +3707,14 @@ namespace ymc
 
 			// Merge root into bestNeighbor
 			mergeTarget[root] = bestNeighbor;
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%d",
+						 root, bestNeighbor, (int)m_vMffcs[root].nNodes,
+						 (int)m_vMffcs[bestNeighbor].nNodes, bestSharedEdges);
+				pifTelemetryRow("pif_mffc_merge.tsv",
+								"mergedIdx\ttargetIdx\tmergedNodes\ttargetNodes\tsharedEdges", buf);
+			}
 
 			// Transfer nodes
 			for (auto nodeId : m_vMffcs[root].vNodeIds)
@@ -3639,6 +3725,11 @@ namespace ymc
 			m_vMffcs[bestNeighbor].nNodes += m_vMffcs[root].nNodes;
 			if (m_vMffcs[root].iMaxLevel > m_vMffcs[bestNeighbor].iMaxLevel)
 				m_vMffcs[bestNeighbor].iMaxLevel = m_vMffcs[root].iMaxLevel;
+
+			// Transfer strict-MFFC origins (telemetry state).
+			for (auto o : m_vUnitOrigins[root])
+				m_vUnitOrigins[bestNeighbor].push_back(o);
+			m_vUnitOrigins[root].clear();
 
 			// Transfer adjacency (merge neighbor sets)
 			for (auto adjId : m_vMffcs[root].sAdjacentMffcId)
@@ -3674,6 +3765,21 @@ namespace ymc
 				compacted.push_back(std::move(m_vMffcs[i]));
 			}
 			m_vMffcs = std::move(compacted);
+
+			// Remap strict-MFFC origins and split flags (telemetry state).
+			{
+				vector<vector<int32_t>> newOrigins(m_vMffcs.size());
+				vector<bool> newSplit(m_vMffcs.size(), false);
+				for (int i = 0; i < nMffcs; i++)
+				{
+					if (oldToNew[i] < 0)
+						continue;
+					newOrigins[oldToNew[i]] = std::move(m_vUnitOrigins[i]);
+					newSplit[oldToNew[i]] = m_vUnitSplit[i];
+				}
+				m_vUnitOrigins = std::move(newOrigins);
+				m_vUnitSplit = std::move(newSplit);
+			}
 
 			// Rebuild node->MFFC mapping
 			for (int32_t i = 0; i < (int32_t)m_vNode2MffcId.size(); i++)
@@ -3769,6 +3875,7 @@ namespace ymc
 			m_vMffcs[mi].vNodeIds = chunks[0];
 			m_vMffcs[mi].nNodes = (int32_t)chunks[0].size();
 			m_vMffcs[mi].iMaxLevel = 0;
+			m_vUnitSplit[mi] = true; // the split breaks the strict MFFC property
 			for (auto nid : chunks[0])
 			{
 				m_vNode2MffcId[nid] = mi;
@@ -3800,6 +3907,10 @@ namespace ymc
 					m_vNode2MffcId[nid] = newIdx;
 
 				m_vMffcs.push_back(std::move(newMffc));
+				// Fragments inherit the origins of the split unit and are
+				// labeled split fragments (telemetry state).
+				m_vUnitOrigins.push_back(m_vUnitOrigins[mi]);
+				m_vUnitSplit.push_back(true);
 			}
 
 			splitCount++;
@@ -3841,6 +3952,22 @@ namespace ymc
 			m_iTotalWorkLoad += outMffcWorkloads[i];
 		}
 		ylog("[MFFC] Total workload: %lld\n", (long long)m_iTotalWorkLoad);
+
+		// Telemetry: coalesced (post-merge) MFFC table with the active
+		// workload estimate, i.e. exactly the clustering input.
+		{
+			char buf[256];
+			for (int32_t i = 0; i < n; i++)
+			{
+				const MffcUnit &m = m_vMffcs[i];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%d\t%zu",
+						 m.iId, (int)m.nNodes, (int)m.iMaxLevel,
+						 (int)outMffcWorkloads[i], (int)m.iWorkload,
+						 m.sAdjacentMffcId.size());
+				pifTelemetryRow("pif_mffc.tsv",
+								"mffcIdx\tnNodes\tiMaxLevel\tworkload\tiWorkload\tadjCount", buf);
+			}
+		}
 	}
 
 	int32_t MetisAig::computeAdaptiveMffcTargetK(const vector<int32_t> &mffcWorkloads)
@@ -3877,14 +4004,43 @@ namespace ymc
 			K = std::max(2, nM / 3);
 
 		ylog("[MFFC-K] k_wl=%d, k_bn=%d -> K=%d\n", k_wl, k_bn, K);
+		{
+			char buf[256];
+			snprintf(buf, sizeof(buf), "%lld\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d",
+					 (long long)m_iTotalWorkLoad, (int)mffcWorkloads.size(), k_wl, k_bn,
+					 (int)std::max(1, (int32_t)(totalN / 3000)), (int)nM, K,
+					 TARGET_PER_PART, MAX_P, MIN_P,
+					 (int)((int64_t)totalN / 3000), (nM > 4) ? (nM * 2) / 3 : -1);
+			pifTelemetryRow("pif_k.tsv",
+							"totalWL\tnMffc\tk_wl\tk_bn\tk_n\tnM\tK\tTARGET_PER_PART\tMAX_P\tMIN_P\tk_n2\tcap23",
+							buf);
+		}
 		return K;
 	}
 
-	PartitionConfig MetisAig::determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK)
+	PartitionConfig MetisAig::determineMffcPartitionConfig(const vector<int32_t> &mffcWorkloads, int32_t userK, int32_t effectiveJ)
 	{
 		PartitionConfig config;
-		config.targetK = (userK > 0) ? std::min(userK, (int32_t)mffcWorkloads.size())
-									 : computeAdaptiveMffcTargetK(mffcWorkloads);
+		// Effective child concurrency J, shared with the child scheduler:
+		// explicit pif -j wins, otherwise Linux sched_getaffinity
+		// (cpuset/affinity aware) with a hardware-concurrency fallback,
+		// default half the allowed CPUs with a minimum of one.
+		int32_t j = effectiveJ > 0 ? effectiveJ : pifResolveEffectiveJ(0);
+		if (userK > 0)
+		{
+			config.targetK = std::min(userK, (int32_t)mffcWorkloads.size());
+		}
+		else
+		{
+			// Task 18 Stage 5 / Task 19 Stage 3: deterministic dynamic-K
+			// rule (J-based). K = ceil(J/2) with the same resolved J the
+			// scheduler consumes. The Stage 5 screening table measured the
+			// total cost (partition + child makespan + merge) as monotonic
+			// in K on all six frozen designs, with the minimum at the
+			// smallest feasible K and no clstm level movement; explicit
+			// pif -N always overrides this rule.
+			config.targetK = std::min((j + 1) / 2, (int32_t)mffcWorkloads.size());
+		}
 		config.avgWorkload = (config.targetK > 0) ? (m_iTotalWorkLoad / config.targetK) : 0;
 
 		double sum = 0, sum2 = 0;
@@ -3900,8 +4056,17 @@ namespace ymc
 		double factor = std::min(3.0, 1.5 + std::min(cv, 3.0) * 0.5);
 		config.workloadLimit = (config.targetK == 1) ? m_iTotalWorkLoad : (int64_t)(config.avgWorkload * factor);
 
-		ylog("[MFFC] Config: K=%d, avgWL=%lld, limit=%lld\n",
-			 config.targetK, (long long)config.avgWorkload, (long long)config.workloadLimit);
+		ylog("[MFFC] Config: K=%d, J=%d, avgWL=%lld, limit=%lld\n",
+			 config.targetK, j, (long long)config.avgWorkload, (long long)config.workloadLimit);
+		{
+			char buf[256];
+			snprintf(buf, sizeof(buf), "%d\t%d\t%lld\t%lld\t%.4f\t%.4f\t%.4f\t%.4f\t%d",
+					 config.targetK, userK, (long long)config.avgWorkload,
+					 (long long)config.workloadLimit, cv, factor, mean, sd, n);
+			pifTelemetryRow("pif_config.tsv",
+							"targetK\tuserK\tavgWorkload\tworkloadLimit\tcv\tfactor\tmean\tsd\tnMffc",
+							buf);
+		}
 		return config;
 	}
 
@@ -3936,6 +4101,12 @@ namespace ymc
 							dist[nb2] = 2;
 				}
 			seeds++;
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d", idx, (int)mffcWorkloads[idx], dist[idx], seeds - 1);
+				pifTelemetryRow("pif_seed.tsv",
+								"mffcIdx\tworkload\tdist\tseedOrder", buf);
+			}
 		};
 
 		int best = 0;
@@ -3976,25 +4147,45 @@ namespace ymc
 		{
 			if (id2cl[idx] != -1)
 				continue;
-			int bc = findBestClusterForMffc(idx, config, id2cl, mffcWorkloads);
+			double score = 0.0;
+			int bc = findBestClusterForMffc(idx, config, id2cl, mffcWorkloads, &score);
 			if (bc != -1)
 			{
 				id2cl[idx] = bc;
 				m_vClusters[bc].vConeIds.push_back(idx);
 				m_vClusters[bc].iWorkload += mffcWorkloads[idx];
+				{
+					char buf[256];
+					snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%.4f\t0", idx,
+							 bc, (int)mffcWorkloads[idx], score);
+					pifTelemetryRow("pif_grow.tsv",
+									"mffcIdx\tclusterId\tworkload\tscore\torphan", buf);
+				}
 			}
 			else
+			{
 				assignOrphanMffc(idx, id2cl, mffcWorkloads);
+				{
+					char buf[256];
+					snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%.4f\t1", idx,
+							 id2cl[idx], (int)mffcWorkloads[idx], score);
+					pifTelemetryRow("pif_grow.tsv",
+									"mffcIdx\tclusterId\tworkload\tscore\torphan", buf);
+				}
+			}
 		}
 		m_vMffcId2ClusterId = id2cl;
 	}
 
 	int MetisAig::findBestClusterForMffc(int mIdx, const PartitionConfig &config,
-										 const vector<int> &id2cl, const vector<int32_t> &wls)
+										 const vector<int> &id2cl, const vector<int32_t> &wls,
+										 double *pOutScore)
 	{
 		int best = -1;
 		double maxS = -1e18;
 		int32_t mffcWL = wls[mIdx];
+		if (pOutScore)
+			*pOutScore = 0.0;
 
 		// Count total boundary edges of this MFFC (proxy for how many
 		// cut edges placing it in the wrong cluster would create)
@@ -4037,6 +4228,8 @@ namespace ymc
 				best = cl.iId;
 			}
 		}
+		if (pOutScore)
+			*pOutScore = (best >= 0) ? maxS : -1e18;
 		return best;
 	}
 
@@ -4138,6 +4331,13 @@ namespace ymc
 					}
 				if (bt < 0)
 					break;
+				{
+					char buf[256];
+					snprintf(buf, sizeof(buf), "%d\t%d\t%d", mi, bt,
+							 (int)m_vClusters[mi].iWorkload);
+					pifTelemetryRow("pif_cap.tsv",
+									"clusterId\ttargetId\tworkload", buf);
+				}
 				for (auto mid : m_vClusters[mi].vConeIds)
 					m_vClusters[bt].vConeIds.push_back(mid);
 				m_vClusters[bt].iWorkload += m_vClusters[mi].iWorkload;
@@ -4160,6 +4360,32 @@ namespace ymc
 
 		ylog("[MFFC] Final: %d partitions, totalWL=%lld\n", (int)m_vClusters.size(), (long long)m_iTotalWorkLoad);
 		printClusters();
+
+		// Telemetry: final cluster table (cluster id, predicted workload,
+		// node count, cone/MFFC count, max level) and the predicted
+		// critical cluster.
+		{
+			char buf[256];
+			int critIdx = -1;
+			int64_t critWl = -1;
+			for (int i = 0; i < (int)m_vClusters.size(); i++)
+			{
+				const Cluster &c = m_vClusters[i];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%zu\t%d",
+						 c.iId, (int)c.iWorkload, (int)c.nNodes,
+						 c.vConeIds.size(), (int)c.iMaxLevel);
+				pifTelemetryRow("pif_final.tsv",
+								"clusterId\tworkload\tnNodes\tnMffc\tiMaxLevel", buf);
+				if ((int64_t)c.iWorkload > critWl)
+				{
+					critWl = c.iWorkload;
+					critIdx = i;
+				}
+			}
+			snprintf(buf, sizeof(buf), "critical\t%d\t%lld", critIdx, (long long)critWl);
+			pifTelemetryRow("pif_final.tsv",
+							"clusterId\tworkload\tnNodes\tnMffc\tiMaxLevel", buf);
+		}
 	}
 
 	void MetisAig::rebalanceMffcClusters(vector<int32_t> &mffcWorkloads)
@@ -4234,6 +4460,13 @@ namespace ymc
 				m_vClusters[bt].vConeIds.push_back(mid);
 				m_vMffcId2ClusterId[mid] = bt;
 			}
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d", ci, bt, be,
+						 (int)m_vClusters[ci].iWorkload);
+				pifTelemetryRow("pif_rebalance.tsv",
+								"clusterId\ttargetId\tedges\tworkload", buf);
+			}
 			m_vClusters[bt].iWorkload += m_vClusters[ci].iWorkload;
 			m_vClusters[bt].nNodes += m_vClusters[ci].nNodes;
 			m_vClusters[ci].vConeIds.clear();
@@ -4264,6 +4497,15 @@ namespace ymc
 			if (m_vClusters[ci].nNodes <= thr || m_vClusters[ci].vConeIds.size() <= 1)
 				continue;
 			int nS = std::max(2, (int)((m_vClusters[ci].nNodes + thr - 1) / thr));
+			{
+				char buf[256];
+				snprintf(buf, sizeof(buf), "%d\t%lld\t%d\t%lld\t%d\t%lld",
+						 ci, (long long)m_vClusters[ci].nNodes, (int)thr, nS,
+						 (long long)m_vClusters[ci].iWorkload,
+						 (long long)(m_vClusters[ci].iWorkload / std::max(nS, 1)));
+				pifTelemetryRow("pif_split.tsv",
+								"clusterId\tnNodes\tthr\tnSplits\tworkload\tperSplit", buf);
+			}
 
 			vector<pair<int, int32_t>> infos;
 			for (auto mid : m_vClusters[ci].vConeIds)
@@ -4353,9 +4595,45 @@ namespace ymc
 				 { return a.iWorkload < b.iWorkload; });
 		}
 
+		m_vCluster2PartitionId.assign(m_vClusters.size(), -1);
 		for (int i = 0; i < (int)partitions.size(); i++)
 			for (auto cid : partitions[i].vClusterIds)
+			{
 				setGraphPartitionMffc(m_vClusters[cid], i);
+				if (cid >= 0 && cid < (int32_t)m_vCluster2PartitionId.size())
+					m_vCluster2PartitionId[cid] = i;
+			}
+
+		// Task 17 Stage 2: behavior-neutral PartitionUnit/hypergraph
+		// telemetry over the control assignment (gated by
+		// PIF_TELEMETRY_DIR; never affects selection).
+		buildHypergraphTelemetry();
+
+		// Telemetry: per-partition predicted workload in graph partition order.
+		m_vPartitionWorkload.clear();
+		m_vPartitionWorkload.reserve(partitions.size());
+		for (const auto &p : partitions)
+			m_vPartitionWorkload.push_back(p.iWorkload);
+		{
+			int critIdx = -1;
+			int64_t critWl = -1;
+			char buf[256];
+			for (int i = 0; i < (int)m_vPartitionWorkload.size(); i++)
+			{
+				snprintf(buf, sizeof(buf), "part\t%d\t%lld", i,
+						 (long long)m_vPartitionWorkload[i]);
+				pifTelemetryRow("pif_partition.tsv",
+								"kind\tpartitionIdx\tworkload", buf);
+				if (m_vPartitionWorkload[i] > critWl)
+				{
+					critWl = m_vPartitionWorkload[i];
+					critIdx = i;
+				}
+			}
+			snprintf(buf, sizeof(buf), "critical\t%d\t%lld", critIdx, (long long)critWl);
+			pifTelemetryRow("pif_partition.tsv",
+							"kind\tpartitionIdx\tworkload", buf);
+		}
 
 		// Safety net: assign all remaining unpartitioned non-PO nodes.
 		// MFFC only covers AND nodes; PI/Const nodes that are not
@@ -4398,15 +4676,108 @@ namespace ymc
 		}
 	}
 
-	void MetisAig::parseAigMffc(int32_t userK)
+	void MetisAig::buildHypergraphTelemetry()
+	{
+		if (!pifTelemetryDir())
+			return;
+
+		// unit -> partition from the control clustering.
+		std::vector<int32_t> unit2part(m_vMffcs.size(), -1);
+		for (size_t ui = 0; ui < m_vMffcs.size(); ui++)
+		{
+			int32_t cid = (ui < m_vMffcId2ClusterId.size()) ? m_vMffcId2ClusterId[ui] : -1;
+			if (cid >= 0 && cid < (int32_t)m_vCluster2PartitionId.size())
+				unit2part[ui] = m_vCluster2PartitionId[cid];
+		}
+
+		m_hg.build(m_vNodes, m_vNode2MffcId, m_vMffcs, m_vUnitOrigins, m_vUnitSplit);
+		m_hg.assignControl(unit2part);
+
+		// Strict (pre-merge) MFFC origins per post-preprocessing unit.
+		{
+			char buf[256];
+			for (size_t ui = 0; ui < m_vUnitOrigins.size(); ui++)
+				for (int32_t o : m_vUnitOrigins[ui])
+				{
+					snprintf(buf, sizeof(buf), "%zu\t%d", ui, (int)o);
+					pifTelemetryRow("pif_unit_origin.tsv",
+									"unitId\toriginMffcId", buf);
+				}
+		}
+		m_hg.exportTelemetry();
+
+		ylog("[MFFC-HG] %lld units, %lld edges (%lld internal, %lld PI, %lld PO, "
+			 "%lld const), %lld singleton, %lld cut nets, connectivity=%lld, "
+			 "crossPartPins=%lld, predInterfaces=%lld, partCapMax=%lld (CV %.3f)\n",
+			 (long long)m_hg.nUnits(), (long long)m_hg.nEdges(),
+			 (long long)m_hg.nInternalEdges(), (long long)m_hg.nPiEdges(),
+			 (long long)m_hg.nPoEdges(), (long long)m_hg.nConstEdges(),
+			 (long long)m_hg.nSingletonEdges(), (long long)m_hg.nCutNets(),
+			 (long long)m_hg.connectivityCost(), (long long)m_hg.crossPartitionPins(),
+			 (long long)m_hg.predictedInterfaces(), (long long)m_hg.partCapacityMax(),
+			 m_hg.partCapacityCv());
+	}
+
+	void MetisAig::runHypergraphPartitioning(const PartitionConfig &config,
+											 const vector<int32_t> &mffcWorkloads)
+	{
+		// Deterministic internal multilevel partitioner over the
+		// post-preprocessing PartitionUnits. Target K comes from the same
+		// explicit-K or adaptive-K calculation as the control; exactly K
+		// non-empty parts are produced (K = min(targetK, nM)).
+		if (getenv("PIF_HG_DEBUG"))
+			ylog("[HG-DBG] runHypergraphPartitioning: build start\n");
+		m_hg.build(m_vNodes, m_vNode2MffcId, m_vMffcs, m_vUnitOrigins, m_vUnitSplit);
+		if (getenv("PIF_HG_DEBUG"))
+			ylog("[HG-DBG] hypergraph built: units=%lld edges=%lld\n",
+				 (long long)m_hg.nUnits(), (long long)m_hg.nEdges());
+		int32_t K = std::min(config.targetK, (int32_t)m_vMffcs.size());
+		if (K < 1)
+			K = 1;
+		std::vector<int32_t> unit2part = m_hg.partitionMultiway(K);
+
+		// One cluster per part; every unit is assigned exactly once.
+		m_vClusters.clear();
+		m_vClusters.reserve(K);
+		for (int32_t p = 0; p < K; p++)
+			m_vClusters.emplace_back(p, 0);
+		for (size_t ui = 0; ui < m_vMffcs.size(); ui++)
+		{
+			int32_t p = (ui < unit2part.size()) ? unit2part[ui] : -1;
+			if (p < 0 || p >= K)
+				p = 0; // safety net: never lose or duplicate a unit
+			m_vClusters[p].vConeIds.push_back((int32_t)ui);
+			m_vClusters[p].iWorkload += mffcWorkloads[ui];
+			m_vClusters[p].nNodes += m_vMffcs[ui].nNodes;
+			if (m_vMffcs[ui].iMaxLevel > m_vClusters[p].iMaxLevel)
+				m_vClusters[p].iMaxLevel = m_vMffcs[ui].iMaxLevel;
+		}
+		m_vMffcId2ClusterId.assign(m_vMffcs.size(), -1);
+		for (int32_t p = 0; p < K; p++)
+			for (auto mid : m_vClusters[p].vConeIds)
+				m_vMffcId2ClusterId[mid] = p;
+
+		m_iTotalWorkLoad = 0;
+		m_iMaxClusterWorkLoad = 0;
+		for (auto &cl : m_vClusters)
+		{
+			m_iTotalWorkLoad += cl.iWorkload;
+			if (cl.iWorkload > m_iMaxClusterWorkLoad)
+				m_iMaxClusterWorkLoad = cl.iWorkload;
+		}
+		ylog("[MFFC] Final: %d partitions, totalWL=%lld\n",
+			 (int)m_vClusters.size(), (long long)m_iTotalWorkLoad);
+		printClusters();
+	}
+
+	void MetisAig::parseAigMffc(int32_t userK, int32_t effectiveJ)
 	{
 		m_useMffc = true;
 		m_forceK = userK;
 		vector<int32_t> mffcWorkloads;
 		preprocessMffcs(mffcWorkloads);
-		PartitionConfig config = determineMffcPartitionConfig(mffcWorkloads, userK);
-		runMffcClusteringAlgorithm(config, mffcWorkloads);
-		postProcessMffcClusters();
+		PartitionConfig config = determineMffcPartitionConfig(mffcWorkloads, userK, effectiveJ);
+		runHypergraphPartitioning(config, mffcWorkloads);
 	}
 
 } // for namespace

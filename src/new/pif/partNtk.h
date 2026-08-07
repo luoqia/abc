@@ -1,12 +1,12 @@
 #pragma once
 
 #include "yaig.h"
-#include "omp.h"
 #include "base/io/ioAbc.h"
 #include <chrono>
 #include <numeric>
 #include "base/abc/abc.h"
 #include <sys/time.h>
+#include <linux/limits.h> // PATH_MAX
 
 #include "new/pif/partNtkFuncs.h"
 
@@ -39,15 +39,20 @@ namespace ymc
 		~PartNtk();
 		PartNtk(Abc_Ntk_t *pNtkOrigin, uint32_t nParts, uint32_t sCluster,
 				char *dirName, const char *optScript = nullptr,
-				const char *mapType = nullptr, const char *libPath = nullptr)
-			: m_nParts(nParts), m_pOriginNtk(pNtkOrigin), m_sCluster(sCluster)
+				const char *mapType = nullptr, const char *libPath = nullptr,
+				int nMaxConcurrent = 0, const char *tmpDir = nullptr,
+				bool fStrict = false)
+			: m_nParts(nParts), m_pOriginNtk(pNtkOrigin), m_sCluster(sCluster),
+			  m_nMaxConcurrent(nMaxConcurrent), m_fStrict(fStrict),
+			  m_effectiveJ(pifResolveEffectiveJ(nMaxConcurrent))
 		{
-			strcpy(m_dirName, dirName);
+			snprintf(m_dirName, sizeof(m_dirName), "%s", dirName);
 			if (optScript && strlen(optScript) > 0)
 				m_optScript = optScript;
 			m_mapType = (mapType && strlen(mapType) > 0) ? mapType : "";
 			if (libPath && strlen(libPath) > 0)
 				m_libPath = libPath;
+			m_tmpDir = (tmpDir && strlen(tmpDir) > 0) ? tmpDir : "/dev/shm";
 			init();
 		};
 
@@ -81,7 +86,7 @@ namespace ymc
 		Abc_Ntk_t *m_pMappedNtk;
 		vector<Abc_Ntk_t *> m_vSubNtks;
 		vector<Abc_Ntk_t *> m_vSubNtksMapped; // 保留但不再主动使用，后续可删
-		char m_dirName[100];
+		char m_dirName[PATH_MAX];
 		uint32_t m_sCluster;
 		vector<Abc_Ntk_t *> m_vSubNtksOptimized;
 
@@ -92,6 +97,23 @@ namespace ymc
 		std::string m_abcRc;	 // abc.rc 路径
 		std::string m_libPath;	 // 标准单元库路径（ASIC 映射用）
 		bool m_useMffc = true;	 // 使用MFFC-based partition (默认开启)
+
+		// pif engineering hardening (Task 11)
+		int m_nMaxConcurrent = 0;  // -j N: explicit child-process cap; 0 = default policy
+		int m_effectiveJ = 0;      // resolved effective J (Task 19 Stage 3), shared with the K rule
+		std::string m_tmpDir;      // -t <dir>: per-child temporary files; default /dev/shm
+		bool m_fStrict = false;    // -e: a failed/missing/malformed child result fails pif
+		bool m_fPipelineFailed = false;
+		int m_nChildOk = 0;        // per-child outcome counters for the final summary
+		int m_nChildFallback = 0;
+		int m_nChildFailure = 0;
+		double m_dChildElapsedSum = 0.0;
+		double m_dChildElapsedMax = 0.0;
+
+		// Task 16 Stage 3 telemetry: per-child predicted workload in child
+		// index order (copied from the partition graph; -1 when unavailable).
+		// Read only by telemetry, never by selection code.
+		std::vector<int64_t> m_vSubNtkPredWorkload;
 
 		PifTimeStats m_stats;
 	};

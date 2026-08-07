@@ -304,7 +304,7 @@ int If_CutMergeOrdered( If_Man_t * p, If_Cut_t * pC0, If_Cut_t * pC1, If_Cut_t *
             pC->pLeaves[i] = pC0->pLeaves[i];
         }
         pC->nLeaves = nLimit;
-        pC->uSign = pC0->uSign | pC1->uSign;
+        pC->uSign = pC0->uSign | pC1->uSign; //按位或
         return 1;
     }
 
@@ -929,7 +929,7 @@ float If_CutAreaFlow( If_Man_t * p, If_Cut_t * pCut )
     If_Obj_t * pLeaf;
     float Flow, AddOn;
     int i;
-    Flow = If_CutLutArea(p, pCut);
+    Flow = If_CutLutArea(p, pCut); //默认为1
     If_CutForEachLeaf( p, pCut, pLeaf, i )
     {
         if ( pLeaf->nRefs == 0 || If_ObjIsConst1(pLeaf) )
@@ -1058,11 +1058,12 @@ float If_CutAreaDeref( If_Man_t * p, If_Cut_t * pCut )
     If_Obj_t * pLeaf;
     float Area;
     int i;
-    Area = If_CutLutArea(p, pCut);
+    Area = If_CutLutArea(p, pCut); //默认为1
+    //递归计算每个叶子节点的面积
     If_CutForEachLeaf( p, pCut, pLeaf, i )
     {
         assert( pLeaf->nRefs > 0 );
-        if ( --pLeaf->nRefs > 0 || !If_ObjIsAnd(pLeaf) )
+        if ( --pLeaf->nRefs > 0 || !If_ObjIsAnd(pLeaf) ) //如果该叶子节点的引用数递减后大于0或者不是and门，则不继续递归计算
             continue;
         Area += If_CutAreaDeref( p, If_ObjCutBest(pLeaf) );
     }

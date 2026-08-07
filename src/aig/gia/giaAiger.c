@@ -428,9 +428,6 @@ Gia_Man_t * Gia_AigerReadFromMemory( char * pContents, int nFileSize, int fGiaSi
                 }
                 else if ( *pType == 'l' )
                 {
-                    char Buffer[1000];
-                    assert( strlen(pName) < 995 );
-                    sprintf( Buffer, "%s_in", pName );
                     if ( vNamesRegIn == NULL )
                         vNamesRegIn = Vec_PtrStart( nLatches );
                     if ( vNamesRegOut == NULL )
@@ -440,7 +437,7 @@ Gia_Man_t * Gia_AigerReadFromMemory( char * pContents, int nFileSize, int fGiaSi
                         fError = 1;
                         break;
                     }
-                    Vec_PtrWriteEntry( vNamesRegIn,  iTerm, Abc_UtilStrsav(Buffer) );
+                    Vec_PtrWriteEntry( vNamesRegIn,  iTerm, Abc_UtilStrsavTwo(pName, (char *)"_in") );
                     Vec_PtrWriteEntry( vNamesRegOut, iTerm, Abc_UtilStrsav(pName) );
                 }
                 else if ( *pType == 'n' )
@@ -688,16 +685,16 @@ Gia_Man_t * Gia_AigerReadFromMemory( char * pContents, int nFileSize, int fGiaSi
                 if ( fVerbose ) printf( "Finished reading extension \"o\".\n" );
             }
             // read equivalence classes
-            else if ( *pCur == 'e' )
-            {
-                extern Gia_Rpr_t * Gia_AigerReadEquivClasses( unsigned char ** ppPos, int nSize );
-                pCur++;
-                pCurTemp = pCur + Gia_AigerReadInt(pCur) + 4;              pCur += 4;
-                pNew->pReprs = Gia_AigerReadEquivClasses( &pCur, Gia_ManObjNum(pNew) );
-                pNew->pNexts = Gia_ManDeriveNexts( pNew );
-                assert( pCur == pCurTemp );
-                if ( fVerbose ) printf( "Finished reading extension \"e\".\n" );
-            }
+            //else if ( *pCur == 'e' )
+            //{
+            //    extern Gia_Rpr_t * Gia_AigerReadEquivClasses( unsigned char ** ppPos, int nSize );
+            //    pCur++;
+            //    pCurTemp = pCur + Gia_AigerReadInt(pCur) + 4;              pCur += 4;
+            //    pNew->pReprs = Gia_AigerReadEquivClasses( &pCur, Gia_ManObjNum(pNew) );
+            //    pNew->pNexts = Gia_ManDeriveNexts( pNew );
+            //    assert( pCur == pCurTemp );
+            //    if ( fVerbose ) printf( "Finished reading extension \"e\".\n" );
+            //}
             // read flop classes
             else if ( *pCur == 'f' )
             {
@@ -1585,15 +1582,15 @@ void Gia_AigerWriteS( Gia_Man_t * pInit, char * pFileName, int fWriteSymbols, in
         }
     }
     // write equivalences
-    if ( p->pReprs && p->pNexts )
-    {
-        extern Vec_Str_t * Gia_WriteEquivClasses( Gia_Man_t * p );
-        fprintf( pFile, "e" );
-        vStrExt = Gia_WriteEquivClasses( p );
-        Gia_FileWriteBufferSize( pFile, Vec_StrSize(vStrExt) );
-        fwrite( Vec_StrArray(vStrExt), 1, Vec_StrSize(vStrExt), pFile );
-        Vec_StrFree( vStrExt );
-    }
+    //if ( p->pReprs && p->pNexts )
+    //{
+    //    extern Vec_Str_t * Gia_WriteEquivClasses( Gia_Man_t * p );
+    //    fprintf( pFile, "e" );
+    //    vStrExt = Gia_WriteEquivClasses( p );
+    //    Gia_FileWriteBufferSize( pFile, Vec_StrSize(vStrExt) );
+    //    fwrite( Vec_StrArray(vStrExt), 1, Vec_StrSize(vStrExt), pFile );
+    //    Vec_StrFree( vStrExt );
+    //}
     // write flop classes
     if ( p->vFlopClasses )
     {
