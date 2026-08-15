@@ -38,6 +38,7 @@
 #include "aig/saig/saig.h"
 #include "proof/int/int.h"
 #include "proof/dch/dch.h"
+#include "new/dch2/dch2.h"
 #include "proof/ssw/ssw.h"
 #include "opt/cgt/cgt.h"
 #include "bool/kit/kit.h"
@@ -267,6 +268,7 @@ static int Abc_CommandDRefactor              ( Abc_Frame_t * pAbc, int argc, cha
 static int Abc_CommandDc2                    ( Abc_Frame_t * pAbc, int argc, char ** argv );
 static int Abc_CommandDChoice                ( Abc_Frame_t * pAbc, int argc, char ** argv );
 static int Abc_CommandDch                    ( Abc_Frame_t * pAbc, int argc, char ** argv );
+static int Abc_CommandDch2                   ( Abc_Frame_t * pAbc, int argc, char ** argv );
 static int Abc_CommandDrwsat                 ( Abc_Frame_t * pAbc, int argc, char ** argv );
 static int Abc_CommandIRewriteSeq            ( Abc_Frame_t * pAbc, int argc, char ** argv );
 static int Abc_CommandIResyn                 ( Abc_Frame_t * pAbc, int argc, char ** argv );
@@ -1336,6 +1338,7 @@ void Abc_Init( Abc_Frame_t * pAbc )
     Cmd_CommandAdd( pAbc, "New AIG",      "dc2",           Abc_CommandDc2,              1 );
     Cmd_CommandAdd( pAbc, "New AIG",      "dchoice",       Abc_CommandDChoice,          1 );
     Cmd_CommandAdd( pAbc, "New AIG",      "dch",           Abc_CommandDch,              1 );
+    Cmd_CommandAdd( pAbc, "New AIG",      "dch2",          Abc_CommandDch2,             1 );
     Cmd_CommandAdd( pAbc, "New AIG",      "drwsat",        Abc_CommandDrwsat,           1 );
     Cmd_CommandAdd( pAbc, "New AIG",      "irws",          Abc_CommandIRewriteSeq,      1 );
     Cmd_CommandAdd( pAbc, "New AIG",      "iresyn",        Abc_CommandIResyn,           1 );
@@ -18975,6 +18978,72 @@ usage:
   SeeAlso     []
 
 ***********************************************************************/
+int Abc_CommandDch2( Abc_Frame_t * pAbc, int argc, char ** argv )
+{
+    extern Abc_Ntk_t * Abc_NtkDch2( Abc_Ntk_t * pNtk, Dch2_Pars_t * pPars );
+    Dch2_Pars_t Pars, * pPars = &Pars;
+    Abc_Ntk_t * pNtk, * pNtkRes;
+    int c;
+    memset( pPars, 0, sizeof(Dch2_Pars_t) );
+    pPars->nThreads = 1;
+    pPars->nWinSize = 2000;
+    pPars->nHalo    = 100;
+    pPars->nSeed    = 1;
+    pPars->nConfMax = 10000;
+    pPars->fVerbose = 0;
+    Extra_UtilGetoptReset();
+    while ( (c = Extra_UtilGetopt( argc, argv, "jWSHCvh" )) != EOF )
+    {
+        switch ( c )
+        {
+        case 'j':
+            pPars->nThreads = atoi(argv[globalUtilOptind]);
+            if ( pPars->nThreads < 1 ) { Abc_Print( -1, "The number of workers must be at least 1.\n" ); return 1; }
+            break;
+        case 'W':
+            pPars->nWinSize = atoi(argv[globalUtilOptind]);
+            if ( pPars->nWinSize < 10 ) { Abc_Print( -1, "The window size must be at least 10.\n" ); return 1; }
+            break;
+        case 'H':
+            pPars->nHalo = atoi(argv[globalUtilOptind]);
+            if ( pPars->nHalo < 0 ) { Abc_Print( -1, "The halo size cannot be negative.\n" ); return 1; }
+            break;
+        case 'S':
+            pPars->nSeed = atoi(argv[globalUtilOptind]);
+            break;
+        case 'C':
+            pPars->nConfMax = atoi(argv[globalUtilOptind]);
+            if ( pPars->nConfMax < 0 ) { Abc_Print( -1, "The conflict limit cannot be negative.\n" ); return 1; }
+            break;
+        case 'v':
+            pPars->fVerbose ^= 1;
+            break;
+        case 'h':
+            goto usage;
+        default:
+            goto usage;
+        }
+    }
+    pNtk = Abc_FrameReadNtk(pAbc);
+    if ( pNtk == NULL ) { Abc_Print( -1, "Empty network.\n" ); return 1; }
+    if ( !Abc_NtkIsStrash(pNtk) ) { Abc_Print( -1, "DCH2 only works for strashed networks (run strash first).\n" ); return 1; }
+    pNtkRes = Abc_NtkDch2( pNtk, pPars );
+    if ( pNtkRes == NULL ) { Abc_Print( -1, "DCH2 has failed.\n" ); return 1; }
+    Abc_FrameReplaceCurrentNetwork( pAbc, pNtkRes );
+    return 0;
+usage:
+    Abc_Print( -2, "usage: dch2 [-j <num>] [-W <num>] [-H <num>] [-S <num>] [-C <num>] [-vh]\n" );
+    Abc_Print( -2, "\t           deterministic windowed choice construction (Task 42 DCH2)\n" );
+    Abc_Print( -2, "\t-j <num> : the number of workers (1 or 4) [default = %d]\n", pPars->nThreads );
+    Abc_Print( -2, "\t-W <num> : the number of nodes per window [default = %d]\n", pPars->nWinSize );
+    Abc_Print( -2, "\t-H <num> : the halo size on each side of a window [default = %d]\n", pPars->nHalo );
+    Abc_Print( -2, "\t-S <num> : the fixed simulation seed [default = %d]\n", pPars->nSeed );
+    Abc_Print( -2, "\t-C <num> : the SAT conflict limit per verification [default = %d]\n", pPars->nConfMax );
+    Abc_Print( -2, "\t-v       : toggle verbose printout [default = %s]\n", pPars->fVerbose? "yes": "no" );
+    Abc_Print( -2, "\t-h       : print the command usage\n" );
+    return 1;
+}
+
 int Abc_CommandDch( Abc_Frame_t * pAbc, int argc, char ** argv )
 {
     Dch_Pars_t Pars, * pPars = &Pars;
