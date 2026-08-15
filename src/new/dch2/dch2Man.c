@@ -116,56 +116,110 @@ static inline uint64_t Dch2_Sig1( uint64_t * pSig1, Aig_Obj_t * pObj ) { return 
 ///                     SAT VERIFICATION                             ///
 ////////////////////////////////////////////////////////////////////////
 
-// Dups the TFI cone of a literal into a fresh manager (all CIs kept).
-// The copy mapping lives in the caller-provided pCopy array so worker
-// threads never touch the shared manager state (pData stays untouched).
-static void Dch2_DupConeRec( Aig_Man_t * pNew, Aig_Man_t * p, Aig_Obj_t * pObj, Aig_Obj_t ** pCopy )
+typedef struct Dch2_WinRec_t_ Dch2_WinRec_t;
+struct Dch2_WinRec_t_
+{
+	int iWin;
+	int n1; // smaller id
+	int n2; // larger id
+	int fCompl; // 1 when the pair is complementary (n1 == ~n2)
+};
+
+// Batch verification: all candidate pairs of one window share one miter
+// GIA and one circuit-SAT solver state. The copy array and the miter
+// manager are per-thread and reused across windows.
+typedef struct Dch2_VerifyCtx_t_ Dch2_VerifyCtx_t;
+struct Dch2_VerifyCtx_t_
+{
+	Aig_Man_t * pMit;
+	Aig_Obj_t ** pCopy;
+	int nAlloc;
+};
+
+static void Dch2_VerifyCtxInit( Dch2_VerifyCtx_t * pCtx, Aig_Man_t * p, int nMax )
+{
+	pCtx->pMit = Aig_ManStart( 0 );
+	pCtx->pCopy = ABC_ALLOC( Aig_Obj_t *, nMax );
+	memset( pCtx->pCopy, 0, sizeof(Aig_Obj_t *) * nMax );
+	pCtx->nAlloc = nMax;
+	(void)p;
+}
+
+static void Dch2_DupConeRec2( Aig_Man_t * pNew, Aig_Man_t * p, Aig_Obj_t * pObj, Aig_Obj_t ** pCopy )
 {
 	if ( Aig_ObjIsNode(pObj) && pCopy[pObj->Id] == NULL )
 	{
 		Aig_Obj_t * pF0 = Aig_ObjFanin0(pObj);
 		Aig_Obj_t * pF1 = Aig_ObjFanin1(pObj);
-		Dch2_DupConeRec( pNew, p, pF0, pCopy );
-		Dch2_DupConeRec( pNew, p, pF1, pCopy );
+		Dch2_DupConeRec2( pNew, p, pF0, pCopy );
+		Dch2_DupConeRec2( pNew, p, pF1, pCopy );
 		pCopy[pObj->Id] = Aig_And( pNew,
 				Aig_NotCond( pCopy[Aig_ObjId(pF0)], Aig_ObjFaninC0(pObj) ),
 				Aig_NotCond( pCopy[Aig_ObjId(pF1)], Aig_ObjFaninC1(pObj) ) );
 	}
 }
 
-// Returns 1 when the relation is proven by ABC's circuit-based SAT
-// (&sat -c machinery, Cbs_ManSolveMiter): fCompl=0 proves n1 == n2;
-// fCompl=1 proves n1 == ~n2. One dedicated miter per pair keeps worker
-// threads private; the input manager is never written.
-static int Dch2_ManCheckEquiv( Aig_Man_t * p, Aig_Obj_t * pN1, Aig_Obj_t * pN2, int nConfMax, int fCompl )
+// Verifies the candidate pairs of one window in a single batch: one GIA,
+// one circuit-SAT call, per-output status. Returns the verified records.
+static void Dch2_ManVerifyBatch( Aig_Man_t * p, Dch2_VerifyCtx_t * pCtx,
+		const std::vector<Dch2_WinRec_t> & vCand, int nConfMax,
+		std::vector<Dch2_WinRec_t> & vRecs, int iWin, int fVerbose )
 {
-	Aig_Obj_t ** pCopy = ABC_ALLOC( Aig_Obj_t *, Aig_ManObjNumMax(p) );
-	memset( pCopy, 0, sizeof(Aig_Obj_t *) * Aig_ManObjNumMax(p) );
-	Aig_Man_t * pMit = Aig_ManStart( 0 );
+	int nPairs = (int)vCand.size();
+	if ( nPairs == 0 )
+		return;
+	Aig_Man_t * pMit = pCtx->pMit;
+	Aig_Obj_t ** pCopy = pCtx->pCopy;
+	// reset the miter manager and the copy mapping (per-window)
+	Aig_ManStop( pMit );
+	pMit = pCtx->pMit = Aig_ManStart( 0 );
+	memset( pCopy, 0, sizeof(Aig_Obj_t *) * pCtx->nAlloc );
 	pCopy[0] = Aig_ManConst1(pMit);
 	Aig_Obj_t * pObj;
 	int i;
 	Aig_ManForEachCi( p, pObj, i )
 		pCopy[pObj->Id] = Aig_ObjCreateCi( pMit );
-	Dch2_DupConeRec( pMit, p, Aig_Regular(pN1), pCopy );
-	Dch2_DupConeRec( pMit, p, Aig_Regular(pN2), pCopy );
-	Aig_Obj_t * pL1 = Aig_NotCond( pCopy[Aig_ObjId(Aig_Regular(pN1))], Aig_IsComplement(pN1) );
-	Aig_Obj_t * pL2 = Aig_NotCond( pCopy[Aig_ObjId(Aig_Regular(pN2))], Aig_IsComplement(pN2) );
-	// XOR miter (equivalent iff UNSAT) or XNOR miter (complementary iff UNSAT)
-	Aig_Obj_t * pX = fCompl ?
-		Aig_Or( pMit, Aig_And( pMit, pL1, pL2 ), Aig_And( pMit, Aig_Not(pL1), Aig_Not(pL2) ) ) :
-		Aig_Or( pMit, Aig_And( pMit, pL1, Aig_Not(pL2) ), Aig_And( pMit, Aig_Not(pL1), pL2 ) );
-	Aig_ObjCreateCo( pMit, pX );
+	// dup all cones of all candidates (shared subgraphs are shared)
+	for ( auto & Rec : vCand )
+	{
+		Aig_Obj_t * pN1 = Aig_ManObj( p, Rec.n1 );
+		Aig_Obj_t * pN2 = Aig_ManObj( p, Rec.n2 );
+		Dch2_DupConeRec2( pMit, p, Aig_Regular(pN1), pCopy );
+		Dch2_DupConeRec2( pMit, p, Aig_Regular(pN2), pCopy );
+	}
+	// one XOR/XNOR miter output per pair
+	for ( auto & Rec : vCand )
+	{
+		Aig_Obj_t * pN1 = Aig_ManObj( p, Rec.n1 );
+		Aig_Obj_t * pN2 = Aig_ManObj( p, Rec.n2 );
+		Aig_Obj_t * pL1 = Aig_NotCond( pCopy[Aig_ObjId(Aig_Regular(pN1))], Aig_IsComplement(pN1) );
+		Aig_Obj_t * pL2 = Aig_NotCond( pCopy[Aig_ObjId(Aig_Regular(pN2))], Aig_IsComplement(pN2) );
+		Aig_Obj_t * pX = Rec.fCompl ?
+			Aig_Or( pMit, Aig_And( pMit, pL1, pL2 ), Aig_And( pMit, Aig_Not(pL1), Aig_Not(pL2) ) ) :
+			Aig_Or( pMit, Aig_And( pMit, pL1, Aig_Not(pL2) ), Aig_And( pMit, Aig_Not(pL1), pL2 ) );
+		Aig_ObjCreateCo( pMit, pX );
+	}
 	Aig_ManSetRegNum( pMit, 0 );
 	Gia_Man_t * pGia = Gia_ManFromAig( pMit );
 	Vec_Str_t * pStatus = NULL;
 	Cbs_ManSolveMiter( pGia, nConfMax > 0 ? nConfMax : 10000000, &pStatus, 0 );
-	int Ret = Vec_StrSize(pStatus) ? (Vec_StrEntry(pStatus, 0) == 1) : 0;
+	for ( i = 0; i < nPairs; i++ )
+		if ( Vec_StrSize(pStatus) > i && Vec_StrEntry(pStatus, i) == 1 )
+		{
+			Dch2_WinRec_t Rec = vCand[i];
+			Rec.iWin = iWin;
+			vRecs.push_back( Rec );
+		}
+	if ( fVerbose )
+	{
+		int nProved = 0;
+		for ( i = 0; i < nPairs && Vec_StrSize(pStatus) > i; i++ )
+			nProved += (Vec_StrEntry(pStatus, i) == 1);
+		printf( "DCH2-BATCH win=%d pairs=%d proved=%d\n", iWin, nPairs, nProved );
+		fflush(stdout);
+	}
 	Vec_StrFree( pStatus );
 	Gia_ManStop( pGia );
-	Aig_ManStop( pMit );
-	ABC_FREE( pCopy );
-	return Ret;
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -288,15 +342,6 @@ static Aig_Man_t * Dch2_ManDeriveChoices( Aig_Man_t * pAig )
 ///                     WINDOW ENGINE                                ///
 ////////////////////////////////////////////////////////////////////////
 
-typedef struct Dch2_WinRec_t_ Dch2_WinRec_t;
-struct Dch2_WinRec_t_
-{
-	int iWin;
-	int n1; // smaller id
-	int n2; // larger id
-	int fCompl; // 1 when the pair is complementary (n1 == ~n2)
-};
-
 static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * pSig1, uint64_t * pSig2, uint64_t * pSig3,
 		Dch2_Pars_t * pPars,
 		const std::vector<Aig_Obj_t *> & vOrder,
@@ -304,6 +349,12 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 {
 	int nNodes = (int)vOrder.size();
 	int nWin = (nNodes + pPars->nWinSize - 1) / pPars->nWinSize;
+	Dch2_VerifyCtx_t Ctx;
+	Dch2_VerifyCtxInit( &Ctx, p, Aig_ManObjNumMax(p) );
+	// candidate pool: pairs generated by window i, i+1 (halo overlap); the
+	// first (n1 < n2) owner generates a pair exactly once
+	std::map<uint64_t, std::vector<std::pair<Aig_Obj_t *, int>>> bySigNext;
+	int nHalo = pPars->nHalo > 0 ? pPars->nHalo : 0;
 	for ( int iWin = iThread; iWin < nWin; iWin += nThreads )
 	{
 		int iBeg = iWin * pPars->nWinSize;
@@ -321,6 +372,45 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 			int fCompl = (s0 > s0N) ? 1 : 0;
 			bySig[key].push_back( { pObj, fCompl } );
 		}
+		// halo tail of the next window (cross-window candidates)
+		if ( nHalo > 0 && iWin + nThreads < nWin )
+		{
+			int nBeg = (iWin + nThreads) * pPars->nWinSize;
+			int nEnd = std::min( nBeg + nHalo, nNodes );
+			bySigNext.clear();
+			for ( int i = nBeg; i < nEnd; i++ )
+			{
+				Aig_Obj_t * pObj = vOrder[i];
+				uint64_t s0 = Dch2_Sig0(pSig0, pObj);
+				uint64_t s0N = ~s0;
+				uint64_t key = s0 < s0N ? s0 : s0N;
+				int fCompl = (s0 > s0N) ? 1 : 0;
+				bySigNext[key].push_back( { pObj, fCompl } );
+			}
+		}
+		// candidate collection with full four-word agreement
+		std::vector<Dch2_WinRec_t> vCand;
+		auto Collect = [&]( Aig_Obj_t * pN1, Aig_Obj_t * pN2, int fCompl )
+		{
+			int fMatch = 1;
+			for ( int w = 0; w < 4 && fMatch; w++ )
+			{
+				uint64_t wA = (w == 0) ? Dch2_Sig0(pSig0, pN1) :
+					(w == 1) ? pSig1[pN1->Id] : (w == 2) ? pSig2[pN1->Id] : pSig3[pN1->Id];
+				uint64_t wB = (w == 0) ? Dch2_Sig0(pSig0, pN2) :
+					(w == 1) ? pSig1[pN2->Id] : (w == 2) ? pSig2[pN2->Id] : pSig3[pN2->Id];
+				if ( fCompl )
+					wB = ~wB;
+				if ( wA != wB )
+					fMatch = 0;
+			}
+			if ( !fMatch )
+				return;
+			Dch2_WinRec_t Rec;
+			Rec.iWin = iWin; Rec.n1 = Aig_ObjId(pN1); Rec.n2 = Aig_ObjId(pN2);
+			Rec.fCompl = fCompl;
+			vCand.push_back( Rec );
+		};
 		// adjacent pairs per signature group (bounded candidate set)
 		for ( it = bySig.begin(); it != bySig.end(); ++it )
 		{
@@ -329,38 +419,30 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 					[]( const std::pair<Aig_Obj_t *, int> & a, const std::pair<Aig_Obj_t *, int> & b )
 					{ return Aig_ObjId(a.first) < Aig_ObjId(b.first); } );
 			for ( size_t k = 0; k + 1 < vGroup.size(); k++ )
+				Collect( vGroup[k].first, vGroup[k+1].first, vGroup[k].second ^ vGroup[k+1].second );
+		}
+		// cross-window pairs: this window's halo tail vs the next window's head
+		if ( nHalo > 0 && !bySigNext.empty() )
+		{
+			int hBeg = std::max( iBeg, iEnd - nHalo );
+			for ( int i = hBeg; i < iEnd; i++ )
 			{
-				Aig_Obj_t * pN1 = vGroup[k].first;
-				Aig_Obj_t * pN2 = vGroup[k+1].first;
-				int fCompl = vGroup[k].second ^ vGroup[k+1].second;
-				// full four-word signature agreement with the phase
-				{
-					int fMatch = 1;
-					for ( int w = 0; w < 4 && fMatch; w++ )
-					{
-						uint64_t wA = (w == 0) ? Dch2_Sig0(pSig0, pN1) :
-							(w == 1) ? pSig1[pN1->Id] : (w == 2) ? pSig2[pN1->Id] : pSig3[pN1->Id];
-						uint64_t wB = (w == 0) ? Dch2_Sig0(pSig0, pN2) :
-							(w == 1) ? pSig1[pN2->Id] : (w == 2) ? pSig2[pN2->Id] : pSig3[pN2->Id];
-						if ( fCompl )
-							wB = ~wB;
-						if ( wA != wB )
-							fMatch = 0;
-					}
-					if ( !fMatch )
-						continue;
-				}
-				// global-context SAT verification (phase-aware miter)
-				if ( Dch2_ManCheckEquiv( p, pN1, pN2, pPars->nConfMax, fCompl ) )
-				{
-					Dch2_WinRec_t Rec;
-					Rec.iWin = iWin; Rec.n1 = Aig_ObjId(pN1); Rec.n2 = Aig_ObjId(pN2);
-					Rec.fCompl = fCompl;
-					vRecs.push_back( Rec );
-				}
+				Aig_Obj_t * pObj = vOrder[i];
+				uint64_t s0 = Dch2_Sig0(pSig0, pObj);
+				uint64_t key = std::min( s0, ~s0 );
+				auto itN = bySigNext.find( key );
+				if ( itN == bySigNext.end() )
+					continue;
+				int fComplA = (s0 > ~s0) ? 1 : 0;
+				for ( auto & prN : itN->second )
+					Collect( pObj, prN.first, fComplA ^ prN.second );
 			}
 		}
+		// batch verification (shared miter GIA, one SAT session)
+		Dch2_ManVerifyBatch( p, &Ctx, vCand, pPars->nConfMax, vRecs, iWin, pPars->fVerbose );
 	}
+	Aig_ManStop( Ctx.pMit );
+	ABC_FREE( Ctx.pCopy );
 }
 
 ////////////////////////////////////////////////////////////////////////
