@@ -364,7 +364,8 @@ static Aig_Man_t * Dch2_ManDeriveChoices( Aig_Man_t * pAig,
 static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * pSig1, uint64_t * pSig2, uint64_t * pSig3,
 		Dch2_Pars_t * pPars,
 		const std::vector<Aig_Obj_t *> & vOrder,
-		std::vector<Dch2_WinRec_t> & vRecs, int iThread, int nThreads )
+		std::vector<Dch2_WinRec_t> & vRecs, int iThread, int nThreads,
+		long long * pMsVerify )
 {
 	int nNodes = (int)vOrder.size();
 	int nWin = (nNodes + pPars->nWinSize - 1) / pPars->nWinSize;
@@ -479,7 +480,13 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 			}
 		}
 		// batch verification (shared miter GIA, one SAT session)
-		Dch2_ManVerifyBatch( p, &Ctx, vCand, pPars->nConfMax, vRecs, iWin, pPars->fVerbose );
+		{
+			struct timespec t0, t1;
+			clock_gettime( CLOCK_MONOTONIC, &t0 );
+			Dch2_ManVerifyBatch( p, &Ctx, vCand, pPars->nConfMax, vRecs, iWin, pPars->fVerbose );
+			clock_gettime( CLOCK_MONOTONIC, &t1 );
+			*pMsVerify += (long long)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+		}
 	}
 	Aig_ManStop( Ctx.pMit );
 	ABC_FREE( Ctx.pCopy );
@@ -516,21 +523,27 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 
 	// window processing (j1 serial or j4 threaded, worker-private SAT state)
 	std::vector<Dch2_WinRec_t> vRecs;
+	long long msVerify = 0;
 	if ( pPars->nThreads <= 1 )
-		Dch2_ManProcessWindows( pAig, pSig0, pSig1, pSig2, pSig3, pPars, vOrder, vRecs, 0, 1 );
+		Dch2_ManProcessWindows( pAig, pSig0, pSig1, pSig2, pSig3, pPars, vOrder, vRecs, 0, 1, &msVerify );
 	else
 	{
 		int nThreads = std::min( pPars->nThreads, 4 );
 		std::vector<std::vector<Dch2_WinRec_t>> vPerThread( nThreads );
+		std::vector<long long> vMsVerify( nThreads, 0 );
 		std::vector<std::thread> vThreads;
 		for ( int t = 0; t < nThreads; t++ )
 			vThreads.push_back( std::thread( Dch2_ManProcessWindows, pAig, pSig0, pSig1, pSig2, pSig3,
-					pPars, std::cref(vOrder), std::ref(vPerThread[t]), t, nThreads ) );
+					pPars, std::cref(vOrder), std::ref(vPerThread[t]), t, nThreads, &vMsVerify[t] ) );
 		for ( auto & th : vThreads )
 			th.join();
 		for ( auto & v : vPerThread )
 			vRecs.insert( vRecs.end(), v.begin(), v.end() );
+		for ( auto ms : vMsVerify )
+			msVerify += ms;
 	}
+	struct timespec tM0, tM1;
+	clock_gettime( CLOCK_MONOTONIC, &tM0 );
 
 	// stable conflict resolution: union-find over the records in
 	// (window, n2) order; only level-acyclic merges are accepted
@@ -725,10 +738,12 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 					Aig_ObjLevel(Aig_ManObj(pAig, pr.first)), Aig_ObjLevel(Aig_ManObj(pAig, pr.second)) );
 		fflush(stdout);
 	}
-	printf( "DCH2: %d windows, %d candidates, %d verified, %d merged, %d substituted, %d conflicts, %d tfi-skipped\n",
+	clock_gettime( CLOCK_MONOTONIC, &tM1 );
+	long long msMerge = (long long)(tM1.tv_sec - tM0.tv_sec) * 1000 + (tM1.tv_nsec - tM0.tv_nsec) / 1000000;
+	printf( "DCH2: %d windows, %d candidates, %d verified, %d merged, %d substituted, %d conflicts, %d tfi-skipped, verify_ms=%lld merge_ms=%lld\n",
 			(int)((vOrder.size() + pPars->nWinSize - 1) / pPars->nWinSize),
 			(int)vRecs.size(), (int)vRecs.size(), (int)vMerges.size(), (int)vSubsts.size(),
-			nConflict, nTfiSkip );
+			nConflict, nTfiSkip, msVerify, msMerge );
 
 	// no verified merges: return a plain dup with an (empty) pEquivs array
 	// so the choice-aware conversion keeps its invariant
