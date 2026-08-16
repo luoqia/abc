@@ -18992,27 +18992,27 @@ int Abc_CommandDch2( Abc_Frame_t * pAbc, int argc, char ** argv )
     pPars->nConfMax = 10000;
     pPars->fVerbose = 0;
     Extra_UtilGetoptReset();
-    while ( (c = Extra_UtilGetopt( argc, argv, "jWSHCvh" )) != EOF )
+    while ( (c = Extra_UtilGetopt( argc, argv, "j:W:S:H:C:vh" )) != EOF )
     {
         switch ( c )
         {
         case 'j':
-            pPars->nThreads = atoi(argv[globalUtilOptind]);
+            pPars->nThreads = atoi(globalUtilOptarg);
             if ( pPars->nThreads < 1 ) { Abc_Print( -1, "The number of workers must be at least 1.\n" ); return 1; }
             break;
         case 'W':
-            pPars->nWinSize = atoi(argv[globalUtilOptind]);
+            pPars->nWinSize = atoi(globalUtilOptarg);
             if ( pPars->nWinSize < 10 ) { Abc_Print( -1, "The window size must be at least 10.\n" ); return 1; }
             break;
         case 'H':
-            pPars->nHalo = atoi(argv[globalUtilOptind]);
+            pPars->nHalo = atoi(globalUtilOptarg);
             if ( pPars->nHalo < 0 ) { Abc_Print( -1, "The halo size cannot be negative.\n" ); return 1; }
             break;
         case 'S':
-            pPars->nSeed = atoi(argv[globalUtilOptind]);
+            pPars->nSeed = atoi(globalUtilOptarg);
             break;
         case 'C':
-            pPars->nConfMax = atoi(argv[globalUtilOptind]);
+            pPars->nConfMax = atoi(globalUtilOptarg);
             if ( pPars->nConfMax < 0 ) { Abc_Print( -1, "The conflict limit cannot be negative.\n" ); return 1; }
             break;
         case 'v':
