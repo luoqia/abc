@@ -212,10 +212,15 @@ static void Dch2_ManVerifyBatch( Aig_Man_t * p, Dch2_VerifyCtx_t * pCtx,
 		}
 	if ( fVerbose )
 	{
-		int nProved = 0;
+		int nProved = 0, nRejected = 0, nUndecided = 0;
 		for ( i = 0; i < nPairs && Vec_StrSize(pStatus) > i; i++ )
-			nProved += (Vec_StrEntry(pStatus, i) == 1);
-		printf( "DCH2-BATCH win=%d pairs=%d proved=%d\n", iWin, nPairs, nProved );
+		{
+			if ( Vec_StrEntry(pStatus, i) == 1 ) nProved++;
+			else if ( Vec_StrEntry(pStatus, i) == 0 ) nRejected++;
+			else nUndecided++;
+		}
+		printf( "DCH2-BATCH win=%d pairs=%d proved=%d rejected=%d undecided=%d\n",
+				iWin, nPairs, nProved, nRejected, nUndecided );
 		fflush(stdout);
 	}
 	Vec_StrFree( pStatus );
@@ -453,6 +458,26 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 					Collect( pObj, prN.first, fComplA ^ prN.second );
 			}
 		}
+		// test-only fault hook (default off): DCH2_TEST_INJECT=n1,n2 pushes
+		// one deliberately chosen pair into window 0's verification batch;
+		// the real SAT verifier must reject a false pair and the network
+		// must not change
+		if ( iWin == 0 && getenv("DCH2_TEST_INJECT") )
+		{
+			int t1 = -1, t2 = -1;
+			if ( sscanf( getenv("DCH2_TEST_INJECT"), "%d,%d", &t1, &t2 ) == 2 &&
+					t1 >= 0 && t1 < Aig_ManObjNumMax(p) && t2 > 0 && t2 < Aig_ManObjNumMax(p) )
+			{
+				Dch2_WinRec_t Rec;
+				Rec.iWin = iWin; Rec.n1 = t1; Rec.n2 = t2; Rec.fCompl = 0;
+				vCand.push_back( Rec );
+				if ( pPars->fVerbose )
+				{
+					printf( "DCH2-TEST-INJECT n1=%d n2=%d\n", t1, t2 );
+					fflush(stdout);
+				}
+			}
+		}
 		// batch verification (shared miter GIA, one SAT session)
 		Dch2_ManVerifyBatch( p, &Ctx, vCand, pPars->nConfMax, vRecs, iWin, pPars->fVerbose );
 	}
@@ -536,6 +561,7 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 	};
 	std::vector<std::pair<int,int>> vMerges;
 	std::vector<std::pair<int,int>> vSubsts; // (node, root) with relative phase
+	int nConflict = 0, nTfiSkip = 0;
 	for ( auto & Rec : vRecs )
 	{
 		auto fr1 = Find( Rec.n1 );
@@ -543,7 +569,10 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 		int r1 = fr1.first;
 		int r2 = fr2.first;
 		if ( r1 == r2 )
+		{
+			nConflict++;
 			continue;
+		}
 		// keep the shallower node as the root (tie-break smaller id):
 		// substitutions/merges then always replace a deeper structure
 		// with a shallower one and levels cannot accumulate
@@ -612,7 +641,10 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 				}
 			}
 			if ( fSkip )
+			{
+				nTfiSkip++;
 				continue;
+			}
 		}
 		vParent[node] = root;
 		vPhase[node] = fPhase;
@@ -693,9 +725,10 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 					Aig_ObjLevel(Aig_ManObj(pAig, pr.first)), Aig_ObjLevel(Aig_ManObj(pAig, pr.second)) );
 		fflush(stdout);
 	}
-	printf( "DCH2: %d windows, %d candidates, %d verified, %d merged, %d substituted\n",
+	printf( "DCH2: %d windows, %d candidates, %d verified, %d merged, %d substituted, %d conflicts, %d tfi-skipped\n",
 			(int)((vOrder.size() + pPars->nWinSize - 1) / pPars->nWinSize),
-			(int)vRecs.size(), (int)vRecs.size(), (int)vMerges.size(), (int)vSubsts.size() );
+			(int)vRecs.size(), (int)vRecs.size(), (int)vMerges.size(), (int)vSubsts.size(),
+			nConflict, nTfiSkip );
 
 	// no verified merges: return a plain dup with an (empty) pEquivs array
 	// so the choice-aware conversion keeps its invariant
