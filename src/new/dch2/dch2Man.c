@@ -259,7 +259,12 @@ static void Dch2_ManSetReprs( Aig_Man_t * p, const std::vector<std::pair<int,int
 }
 
 // Derives the choice AIG (pEquivs) from the representative classes.
-static Aig_Man_t * Dch2_ManDeriveChoices( Aig_Man_t * pAig )
+// Iterates nodes in (level, id) order: the fanout redirect may point at a
+// class representative whose id is larger than the member's (the AIG
+// creation order is DFS-based, not level-monotone), so manager order
+// would reference not-yet-derived copies.
+static Aig_Man_t * Dch2_ManDeriveChoices( Aig_Man_t * pAig,
+		const std::vector<Aig_Obj_t *> & vOrder )
 {
 	Aig_Man_t * pChoices;
 	Aig_Obj_t * pObj;
@@ -273,7 +278,7 @@ static Aig_Man_t * Dch2_ManDeriveChoices( Aig_Man_t * pAig )
 	Aig_ManForEachCi( pAig, pObj, i )
 		pObj->pData = Aig_ObjCreateCi( pChoices );
 	// construct the nodes with choices
-	Aig_ManForEachNode( pAig, pObj, i )
+	for ( auto * pObj : vOrder )
 	{
 		Aig_Obj_t * pRepr = Aig_ObjRepr( pAig, pObj );
 		Aig_Obj_t * pNew;
@@ -297,19 +302,28 @@ static Aig_Man_t * Dch2_ManDeriveChoices( Aig_Man_t * pAig )
 		// carry the correct alias in their pData
 		Aig_Obj_t * pF0 = Aig_ObjFanin0(pObj);
 		Aig_Obj_t * pF1 = Aig_ObjFanin1(pObj);
+		// redirect usage to the class representative ordered by
+		// (level, id): the AIG creation order is DFS-based, so the id is
+		// NOT level-monotone and an id comparison would reject shallow
+		// representatives with larger ids, leaving the deep structure in
+		// place (measured on XS1c: levels did not decrease at all)
 		if ( Aig_ObjIsNode(pF0) )
 		{
 			Aig_Obj_t * pR0 = Aig_ObjRepr( pAig, pF0 );
 			// only regular rep pointers are class reps here; complemented
 			// reps are substituted aliases carried in pData (never deref
 			// a complemented pointer: it is a literal, not an object)
-			if ( pR0 && !Aig_IsComplement(pR0) && Aig_ObjIsNode(pR0) && pR0->Id < pF0->Id )
+			if ( pR0 && !Aig_IsComplement(pR0) && Aig_ObjIsNode(pR0) &&
+					(Aig_ObjLevel(pR0) < Aig_ObjLevel(pF0) ||
+					 (Aig_ObjLevel(pR0) == Aig_ObjLevel(pF0) && pR0->Id < pF0->Id)) )
 				pF0 = pR0;
 		}
 		if ( Aig_ObjIsNode(pF1) )
 		{
 			Aig_Obj_t * pR1 = Aig_ObjRepr( pAig, pF1 );
-			if ( pR1 && !Aig_IsComplement(pR1) && Aig_ObjIsNode(pR1) && pR1->Id < pF1->Id )
+			if ( pR1 && !Aig_IsComplement(pR1) && Aig_ObjIsNode(pR1) &&
+					(Aig_ObjLevel(pR1) < Aig_ObjLevel(pF1) ||
+					 (Aig_ObjLevel(pR1) == Aig_ObjLevel(pF1) && pR1->Id < pF1->Id)) )
 				pF1 = pR1;
 		}
 		pC0 = Aig_NotCond( (Aig_Obj_t *)Aig_Regular(pF0)->pData,
@@ -419,7 +433,8 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 					[]( const std::pair<Aig_Obj_t *, int> & a, const std::pair<Aig_Obj_t *, int> & b )
 					{ return Aig_ObjId(a.first) < Aig_ObjId(b.first); } );
 			for ( size_t k = 0; k + 1 < vGroup.size(); k++ )
-				Collect( vGroup[k].first, vGroup[k+1].first, vGroup[k].second ^ vGroup[k+1].second );
+				for ( size_t m = k + 1; m < vGroup.size() && m <= k + 4; m++ )
+					Collect( vGroup[k].first, vGroup[m].first, vGroup[k].second ^ vGroup[m].second );
 		}
 		// cross-window pairs: this window's halo tail vs the next window's head
 		if ( nHalo > 0 && !bySigNext.empty() )
@@ -529,9 +544,14 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 		int r2 = fr2.first;
 		if ( r1 == r2 )
 			continue;
-		// keep the smaller-id node as the root; require the root's level
-		// strictly below the merged node's level
-		int root = std::min( r1, r2 );
+		// keep the shallower node as the root (tie-break smaller id):
+		// substitutions/merges then always replace a deeper structure
+		// with a shallower one and levels cannot accumulate
+		Aig_Obj_t * pRoot1 = Aig_ManObj( pAig, r1 );
+		Aig_Obj_t * pRoot2 = Aig_ManObj( pAig, r2 );
+		int root = (Aig_ObjLevel(pRoot1) != Aig_ObjLevel(pRoot2)) ?
+			(Aig_ObjLevel(pRoot1) < Aig_ObjLevel(pRoot2) ? r1 : r2) :
+			std::min( r1, r2 );
 		int node = (root == r1) ? r2 : r1;
 		// relative phase of the merged node against the root:
 		// n1 == r1^p1, n2 == r2^p2, n1 == n2^fCompl -> r2 == r1^(p1^p2^fCompl)
@@ -673,10 +693,9 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 					Aig_ObjLevel(Aig_ManObj(pAig, pr.first)), Aig_ObjLevel(Aig_ManObj(pAig, pr.second)) );
 		fflush(stdout);
 	}
-	if ( pPars->fVerbose )
-		printf( "DCH2: %d windows, %d candidates, %d verified, %d merged, %d substituted\n",
-				(int)((vOrder.size() + pPars->nWinSize - 1) / pPars->nWinSize),
-				(int)vRecs.size(), (int)vRecs.size(), (int)vMerges.size(), (int)vSubsts.size() );
+	printf( "DCH2: %d windows, %d candidates, %d verified, %d merged, %d substituted\n",
+			(int)((vOrder.size() + pPars->nWinSize - 1) / pPars->nWinSize),
+			(int)vRecs.size(), (int)vRecs.size(), (int)vMerges.size(), (int)vSubsts.size() );
 
 	// no verified merges: return a plain dup with an (empty) pEquivs array
 	// so the choice-aware conversion keeps its invariant
@@ -689,7 +708,7 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 
 	// choice construction
 	Dch2_ManSetReprs( pAig, vMerges, vSubsts );
-	Aig_Man_t * pChoices = Dch2_ManDeriveChoices( pAig );
+	Aig_Man_t * pChoices = Dch2_ManDeriveChoices( pAig, vOrder );
 	ABC_FREE( pChoices->pReprs );
 	// safety net: the combined (fanin + equiv) graph must be acyclic;
 	// if not, fall back to no choices rather than hang the dup
