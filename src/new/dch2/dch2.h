@@ -9,7 +9,7 @@ ABC_NAMESPACE_HEADER_START
 typedef struct Dch2_Pars_t_ Dch2_Pars_t;
 struct Dch2_Pars_t_
 {
-	int nThreads;  // 1 (j1) or 4 (j4)
+	int nThreads;  // worker count (1..16; the admissible cap)
 	int nWinSize;  // nodes per window (primary block)
 	int nHalo;     // overlap halo on each side
 	int nSeed;     // fixed simulation seed

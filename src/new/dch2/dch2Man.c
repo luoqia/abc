@@ -557,7 +557,7 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 		Dch2_ManProcessWindows( pAig, pSig0, pSig1, pSig2, pSig3, pPars, vOrder, vRecs, 0, 1, &msVerify, &Ctrs );
 	else
 	{
-		int nThreads = std::min( pPars->nThreads, 4 );
+		int nThreads = std::min( pPars->nThreads, 16 );
 		std::vector<std::vector<Dch2_WinRec_t>> vPerThread( nThreads );
 		std::vector<long long> vMsVerify( nThreads, 0 );
 		std::vector<Dch2_Ctrs_t> vCtrs( nThreads );

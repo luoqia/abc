@@ -19034,7 +19034,7 @@ int Abc_CommandDch2( Abc_Frame_t * pAbc, int argc, char ** argv )
 usage:
     Abc_Print( -2, "usage: dch2 [-j <num>] [-W <num>] [-H <num>] [-S <num>] [-C <num>] [-vh]\n" );
     Abc_Print( -2, "\t           deterministic windowed choice construction (Task 42 DCH2)\n" );
-    Abc_Print( -2, "\t-j <num> : the number of workers (1 or 4) [default = %d]\n", pPars->nThreads );
+    Abc_Print( -2, "\t-j <num> : the number of workers (1..16) [default = %d]\n", pPars->nThreads );
     Abc_Print( -2, "\t-W <num> : the number of nodes per window [default = %d]\n", pPars->nWinSize );
     Abc_Print( -2, "\t-H <num> : the halo size on each side of a window [default = %d]\n", pPars->nHalo );
     Abc_Print( -2, "\t-S <num> : the fixed simulation seed [default = %d]\n", pPars->nSeed );
