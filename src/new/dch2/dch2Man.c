@@ -438,10 +438,22 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 		else
 		{
 			// the last window of the design has no next-window partner;
-			// a stale map here would pair its halo tail with the previous
-			// window's head and make the candidate set depend on the
-			// thread assignment
+			// pair its halo tail with its OWN head so the boundary region
+			// keeps deterministic cross-region candidates (this matches
+			// the historical single-threaded behavior and avoids the
+			// thread-assignment-dependent stale map)
+			int nBeg = iBeg;
+			int nEnd = std::min( nBeg + nHalo, iEnd );
 			bySigNext.clear();
+			for ( int i = nBeg; i < nEnd; i++ )
+			{
+				Aig_Obj_t * pObj = vOrder[i];
+				uint64_t s0 = Dch2_Sig0(pSig0, pObj);
+				uint64_t s0N = ~s0;
+				uint64_t key = s0 < s0N ? s0 : s0N;
+				int fCompl = (s0 > s0N) ? 1 : 0;
+				bySigNext[key].push_back( { pObj, fCompl } );
+			}
 		}
 		// candidate collection with full four-word agreement
 		std::vector<Dch2_WinRec_t> vCand;
