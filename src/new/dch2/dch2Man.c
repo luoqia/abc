@@ -435,6 +435,14 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 				bySigNext[key].push_back( { pObj, fCompl } );
 			}
 		}
+		else
+		{
+			// the last window of the design has no next-window partner;
+			// a stale map here would pair its halo tail with the previous
+			// window's head and make the candidate set depend on the
+			// thread assignment
+			bySigNext.clear();
+		}
 		// candidate collection with full four-word agreement
 		std::vector<Dch2_WinRec_t> vCand;
 		auto Collect = [&]( Aig_Obj_t * pN1, Aig_Obj_t * pN2, int fCompl )
