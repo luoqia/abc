@@ -1,0 +1,81 @@
+.model add8
+.inputs a0 b0 a1 b1 a2 b2 a3 b3 a4 b4 a5 b5 a6 b6 a7 b7
+.outputs s0 s1 s2 s3 s4 s5 s6 s7 cout
+.names a0 b0 s0
+01 1
+10 1
+.names a0 b0 c1
+11 1
+.names a1 b1 c1 s1
+001 1
+010 1
+100 1
+111 1
+.names a1 b1 c1 c2
+011 1
+101 1
+110 1
+111 1
+.names a2 b2 c2 s2
+001 1
+010 1
+100 1
+111 1
+.names a2 b2 c2 c3
+011 1
+101 1
+110 1
+111 1
+.names a3 b3 c3 s3
+001 1
+010 1
+100 1
+111 1
+.names a3 b3 c3 c4
+011 1
+101 1
+110 1
+111 1
+.names a4 b4 c4 s4
+001 1
+010 1
+100 1
+111 1
+.names a4 b4 c4 c5
+011 1
+101 1
+110 1
+111 1
+.names a5 b5 c5 s5
+001 1
+010 1
+100 1
+111 1
+.names a5 b5 c5 c6
+011 1
+101 1
+110 1
+111 1
+.names a6 b6 c6 s6
+001 1
+010 1
+100 1
+111 1
+.names a6 b6 c6 c7
+011 1
+101 1
+110 1
+111 1
+.names a7 b7 c7 s7
+001 1
+010 1
+100 1
+111 1
+.names a7 b7 c7 c8
+011 1
+101 1
+110 1
+111 1
+.names c8 cout
+1 1
+.end

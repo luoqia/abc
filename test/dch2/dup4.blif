@@ -1,0 +1,18 @@
+.model dup4
+.inputs x0 x1 x2 s
+.outputs fa fb fc m
+.names x0 x1 t1
+11 1
+.names t1 x2 fa
+11 1
+.names x1 x2 u1
+11 1
+.names u1 x0 fb
+11 1
+.names x0 x2 v1
+11 1
+.names v1 x1 fc
+11 1
+.names s fa m
+11 1
+.end

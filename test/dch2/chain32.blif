@@ -1,0 +1,163 @@
+.model chain32
+.inputs x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20 x21 x22 x23 x24 x25 x26 x27 x28 x29 x30 x31
+.outputs yand yxor
+.names x0 x1 a1
+11 1
+.names a1 x2 a2
+11 1
+.names a2 x3 a3
+11 1
+.names a3 x4 a4
+11 1
+.names a4 x5 a5
+11 1
+.names a5 x6 a6
+11 1
+.names a6 x7 a7
+11 1
+.names a7 x8 a8
+11 1
+.names a8 x9 a9
+11 1
+.names a9 x10 a10
+11 1
+.names a10 x11 a11
+11 1
+.names a11 x12 a12
+11 1
+.names a12 x13 a13
+11 1
+.names a13 x14 a14
+11 1
+.names a14 x15 a15
+11 1
+.names a15 x16 a16
+11 1
+.names a16 x17 a17
+11 1
+.names a17 x18 a18
+11 1
+.names a18 x19 a19
+11 1
+.names a19 x20 a20
+11 1
+.names a20 x21 a21
+11 1
+.names a21 x22 a22
+11 1
+.names a22 x23 a23
+11 1
+.names a23 x24 a24
+11 1
+.names a24 x25 a25
+11 1
+.names a25 x26 a26
+11 1
+.names a26 x27 a27
+11 1
+.names a27 x28 a28
+11 1
+.names a28 x29 a29
+11 1
+.names a29 x30 a30
+11 1
+.names a30 x31 a31
+11 1
+.names a31 yand
+1 1
+.names x0 x1 x1b
+01 1
+10 1
+.names x1b x2 x2b
+01 1
+10 1
+.names x2b x3 x3b
+01 1
+10 1
+.names x3b x4 x4b
+01 1
+10 1
+.names x4b x5 x5b
+01 1
+10 1
+.names x5b x6 x6b
+01 1
+10 1
+.names x6b x7 x7b
+01 1
+10 1
+.names x7b x8 x8b
+01 1
+10 1
+.names x8b x9 x9b
+01 1
+10 1
+.names x9b x10 x10b
+01 1
+10 1
+.names x10b x11 x11b
+01 1
+10 1
+.names x11b x12 x12b
+01 1
+10 1
+.names x12b x13 x13b
+01 1
+10 1
+.names x13b x14 x14b
+01 1
+10 1
+.names x14b x15 x15b
+01 1
+10 1
+.names x15b x16 x16b
+01 1
+10 1
+.names x16b x17 x17b
+01 1
+10 1
+.names x17b x18 x18b
+01 1
+10 1
+.names x18b x19 x19b
+01 1
+10 1
+.names x19b x20 x20b
+01 1
+10 1
+.names x20b x21 x21b
+01 1
+10 1
+.names x21b x22 x22b
+01 1
+10 1
+.names x22b x23 x23b
+01 1
+10 1
+.names x23b x24 x24b
+01 1
+10 1
+.names x24b x25 x25b
+01 1
+10 1
+.names x25b x26 x26b
+01 1
+10 1
+.names x26b x27 x27b
+01 1
+10 1
+.names x27b x28 x28b
+01 1
+10 1
+.names x28b x29 x29b
+01 1
+10 1
+.names x29b x30 x30b
+01 1
+10 1
+.names x30b x31 x31b
+01 1
+10 1
+.names x31b yxor
+1 1
+.end
