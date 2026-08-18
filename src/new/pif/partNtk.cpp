@@ -1715,6 +1715,20 @@ namespace pif
 		printf("==========================================================\n");
 		printf("TOTAL RUNTIME:                      %8.4f s\n", m_stats.timeTotal);
 		printf("==========================================================\n");
+
+		// Stable versioned machine record on the ABC output path, emitted
+		// only when the Yosys abc pass requests the timing channel
+		// (YOSYS_PIF_TIMING set). Values are the already-measured phase
+		// walls; never derived from the decorative block above.
+		if (getenv("YOSYS_PIF_TIMING"))
+		{
+			double child_wall = m_stats.timeOptTotal > 1e-9 ? m_stats.timeOptTotal : 1.0;
+			printf("@@PIF_TIMING_V1 partition_s=%.6f tag_ports_s=%.6f child_wall_s=%.6f child_sum_s=%.6f child_max_s=%.6f effective_concurrency=%.6f align_s=%.6f merge_s=%.6f\n",
+				   m_stats.timePartition, m_stats.timeTagPorts, m_stats.timeOptTotal,
+				   m_dChildElapsedSum, m_dChildElapsedMax,
+				   m_dChildElapsedSum / child_wall,
+				   m_stats.timeAlign, m_stats.timeMerge);
+		}
 	}
 
 	void PartNtk::Abc_NtkWriteBlif()
