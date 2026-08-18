@@ -136,6 +136,17 @@ struct Dch2_VerifyCtx_t_
 	int nAlloc;
 };
 
+// Per-thread verification outcome counters (proposed pairs, SAT-rejected,
+// and conflict-limited undecided results). Verified pairs are the records
+// pushed into vRecs.
+typedef struct Dch2_Ctrs_t_ Dch2_Ctrs_t;
+struct Dch2_Ctrs_t_
+{
+	long long nProposed;
+	long long nRejected;
+	long long nUndecided;
+};
+
 static void Dch2_VerifyCtxInit( Dch2_VerifyCtx_t * pCtx, Aig_Man_t * p, int nMax )
 {
 	pCtx->pMit = Aig_ManStart( 0 );
@@ -163,9 +174,11 @@ static void Dch2_DupConeRec2( Aig_Man_t * pNew, Aig_Man_t * p, Aig_Obj_t * pObj,
 // one circuit-SAT call, per-output status. Returns the verified records.
 static void Dch2_ManVerifyBatch( Aig_Man_t * p, Dch2_VerifyCtx_t * pCtx,
 		const std::vector<Dch2_WinRec_t> & vCand, int nConfMax,
-		std::vector<Dch2_WinRec_t> & vRecs, int iWin, int fVerbose )
+		std::vector<Dch2_WinRec_t> & vRecs, int iWin, int fVerbose,
+		Dch2_Ctrs_t * pCtrs )
 {
 	int nPairs = (int)vCand.size();
+	pCtrs->nProposed += nPairs;
 	if ( nPairs == 0 )
 		return;
 	Aig_Man_t * pMit = pCtx->pMit;
@@ -210,6 +223,15 @@ static void Dch2_ManVerifyBatch( Aig_Man_t * p, Dch2_VerifyCtx_t * pCtx,
 			Rec.iWin = iWin;
 			vRecs.push_back( Rec );
 		}
+	for ( i = 0; i < nPairs; i++ )
+	{
+		if ( Vec_StrSize(pStatus) <= i )
+			continue;
+		if ( Vec_StrEntry(pStatus, i) == 0 )
+			pCtrs->nRejected++;
+		else if ( Vec_StrEntry(pStatus, i) != 1 )
+			pCtrs->nUndecided++;
+	}
 	if ( fVerbose )
 	{
 		int nProved = 0, nRejected = 0, nUndecided = 0;
@@ -365,7 +387,7 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 		Dch2_Pars_t * pPars,
 		const std::vector<Aig_Obj_t *> & vOrder,
 		std::vector<Dch2_WinRec_t> & vRecs, int iThread, int nThreads,
-		long long * pMsVerify )
+		long long * pMsVerify, Dch2_Ctrs_t * pCtrs )
 {
 	int nNodes = (int)vOrder.size();
 	int nWin = (nNodes + pPars->nWinSize - 1) / pPars->nWinSize;
@@ -488,7 +510,7 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 		{
 			struct timespec t0, t1;
 			clock_gettime( CLOCK_MONOTONIC, &t0 );
-			Dch2_ManVerifyBatch( p, &Ctx, vCand, pPars->nConfMax, vRecs, iWin, pPars->fVerbose );
+			Dch2_ManVerifyBatch( p, &Ctx, vCand, pPars->nConfMax, vRecs, iWin, pPars->fVerbose, pCtrs );
 			clock_gettime( CLOCK_MONOTONIC, &t1 );
 			*pMsVerify += (long long)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
 		}
@@ -529,23 +551,34 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 	// window processing (j1 serial or j4 threaded, worker-private SAT state)
 	std::vector<Dch2_WinRec_t> vRecs;
 	long long msVerify = 0;
+	Dch2_Ctrs_t Ctrs;
+	memset( &Ctrs, 0, sizeof(Ctrs) );
 	if ( pPars->nThreads <= 1 )
-		Dch2_ManProcessWindows( pAig, pSig0, pSig1, pSig2, pSig3, pPars, vOrder, vRecs, 0, 1, &msVerify );
+		Dch2_ManProcessWindows( pAig, pSig0, pSig1, pSig2, pSig3, pPars, vOrder, vRecs, 0, 1, &msVerify, &Ctrs );
 	else
 	{
 		int nThreads = std::min( pPars->nThreads, 4 );
 		std::vector<std::vector<Dch2_WinRec_t>> vPerThread( nThreads );
 		std::vector<long long> vMsVerify( nThreads, 0 );
+		std::vector<Dch2_Ctrs_t> vCtrs( nThreads );
+		for ( auto & c : vCtrs )
+			memset( &c, 0, sizeof(c) );
 		std::vector<std::thread> vThreads;
 		for ( int t = 0; t < nThreads; t++ )
 			vThreads.push_back( std::thread( Dch2_ManProcessWindows, pAig, pSig0, pSig1, pSig2, pSig3,
-					pPars, std::cref(vOrder), std::ref(vPerThread[t]), t, nThreads, &vMsVerify[t] ) );
+					pPars, std::cref(vOrder), std::ref(vPerThread[t]), t, nThreads, &vMsVerify[t], &vCtrs[t] ) );
 		for ( auto & th : vThreads )
 			th.join();
 		for ( auto & v : vPerThread )
 			vRecs.insert( vRecs.end(), v.begin(), v.end() );
 		for ( auto ms : vMsVerify )
 			msVerify += ms;
+		for ( auto & c : vCtrs )
+		{
+			Ctrs.nProposed += c.nProposed;
+			Ctrs.nRejected += c.nRejected;
+			Ctrs.nUndecided += c.nUndecided;
+		}
 	}
 	struct timespec tM0, tM1;
 	clock_gettime( CLOCK_MONOTONIC, &tM0 );
@@ -745,9 +778,10 @@ Aig_Man_t * Dch2_ManComputeChoices( Aig_Man_t * pAig, Dch2_Pars_t * pPars )
 	}
 	clock_gettime( CLOCK_MONOTONIC, &tM1 );
 	long long msMerge = (long long)(tM1.tv_sec - tM0.tv_sec) * 1000 + (tM1.tv_nsec - tM0.tv_nsec) / 1000000;
-	printf( "DCH2: %d windows, %d candidates, %d verified, %d merged, %d substituted, %d conflicts, %d tfi-skipped, verify_ms=%lld merge_ms=%lld\n",
+	printf( "DCH2: %d windows, %d candidates, %d verified, %d rejected, %d undecided, %d merged, %d substituted, %d conflicts, %d tfi-skipped, verify_ms=%lld merge_ms=%lld\n",
 			(int)((vOrder.size() + pPars->nWinSize - 1) / pPars->nWinSize),
-			(int)vRecs.size(), (int)vRecs.size(), (int)vMerges.size(), (int)vSubsts.size(),
+			(int)Ctrs.nProposed, (int)vRecs.size(), (int)Ctrs.nRejected, (int)Ctrs.nUndecided,
+			(int)vMerges.size(), (int)vSubsts.size(),
 			nConflict, nTfiSkip, msVerify, msMerge );
 
 	// no verified merges: return a plain dup with an (empty) pEquivs array
