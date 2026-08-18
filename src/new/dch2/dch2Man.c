@@ -435,13 +435,13 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 				bySigNext[key].push_back( { pObj, fCompl } );
 			}
 		}
-		else
+		else if ( iWin > 0 )
 		{
-			// the last window of the design has no next-window partner;
-			// pair its halo tail with its OWN head so the boundary region
-			// keeps deterministic cross-region candidates (this matches
-			// the historical single-threaded behavior and avoids the
-			// thread-assignment-dependent stale map)
+			// the last window of a multi-window design has no next-window
+			// partner; pair its halo tail with its OWN head so the
+			// boundary region keeps deterministic cross-region candidates
+			// (the historical single-threaded behavior, made deterministic
+			// instead of depending on the thread assignment)
 			int nBeg = iBeg;
 			int nEnd = std::min( nBeg + nHalo, iEnd );
 			bySigNext.clear();
@@ -503,7 +503,8 @@ static void Dch2_ManProcessWindows( Aig_Man_t * p, uint64_t * pSig0, uint64_t * 
 					continue;
 				int fComplA = (s0 > ~s0) ? 1 : 0;
 				for ( auto & prN : itN->second )
-					Collect( pObj, prN.first, fComplA ^ prN.second );
+					if ( pObj != prN.first )
+						Collect( pObj, prN.first, fComplA ^ prN.second );
 			}
 		}
 		// test-only fault hook (default off): DCH2_TEST_INJECT=n1,n2 pushes
