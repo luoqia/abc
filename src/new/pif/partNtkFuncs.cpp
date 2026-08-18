@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <sys/types.h>
 
-namespace ymc
+namespace pif
 {
 
 	MetisGraph::MetisGraph(Abc_Ntk_t *pNtk, bool fMetis)
@@ -2487,7 +2487,7 @@ namespace ymc
 			{
 				if(fanout.iLevel - fanin.iLevel == 130)
 				{
-					ylog("===========\nymc: This may be a critical cut\n");
+					ylog("===========\npif: This may be a critical cut\n");
 					ylog("cone[%d]: edge: node[%d]->node[%d]\n", cone.iId, fanin.id, fanout.id);
 					m_tmp0++;
 				}

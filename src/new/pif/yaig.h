@@ -27,7 +27,7 @@
 
 using namespace std;
 
-namespace ymc
+namespace pif
 {
 
 	class Literal

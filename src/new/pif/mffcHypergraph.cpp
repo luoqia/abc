@@ -11,7 +11,7 @@
 #include <queue>
 #include <set>
 
-namespace ymc
+namespace pif
 {
 	// Task 18 Stage 2: opt-in, behavior-neutral scale profiler.
 	// Gated by the PIF_HG_PROFILE environment variable (disabled by
@@ -1210,4 +1210,4 @@ namespace ymc
 		return unit2part;
 	}
 
-} // namespace ymc
+} // namespace pif

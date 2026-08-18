@@ -690,15 +690,12 @@ extern Vec_Ptr_t * Abc_NtkCollectCoNames( Abc_Ntk_t * pNtk );
 
 extern void Extra_BitMatrixTransposeP( Vec_Wrd_t * vSimsIn, int nWordsIn, Vec_Wrd_t * vSimsOut, int nWordsOut );
 
-// added by ymc
+// added by pif
 #include <sys/time.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
-int ymc_hello_wrapper();
-int ymc_try_metis_wrapper();
-int ymc_test_yaig_wrapper();
-Abc_Ntk_t *ymc_pif_wrapper(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster, char *dirName, char *optScript, char *mapType, char *libPath, int nMaxConcurrent, char *tmpDir, bool fStrict);
+Abc_Ntk_t *pif_run_wrapper(Abc_Ntk_t *pNtk, uint32_t nParts, uint32_t sCluster, char *dirName, char *optScript, char *mapType, char *libPath, int nMaxConcurrent, char *tmpDir, bool fStrict);
 #ifdef __cplusplus
 }
 #endif
@@ -874,7 +871,7 @@ static int Abc_CommandPif(Abc_Frame_t *pAbc, int argc, char **argv)
 			return 1;
 		}
 
-		pNtkRes = ymc_pif_wrapper(pNtk, nParts, sCluster, dirName, optScript, mapType, libPath,
+		pNtkRes = pif_run_wrapper(pNtk, nParts, sCluster, dirName, optScript, mapType, libPath,
 								  nMaxConcurrent, tmpDir, fStrict);
 		if (pNtkRes == NULL) {
 			Abc_Print(-1, "pif has failed.\n");
@@ -1227,7 +1224,7 @@ void Abc_Init( Abc_Frame_t * pAbc )
     Cmd_CommandAdd( pAbc, "Synthesis",    "resub_core",    Abc_CommandResubCore,        1 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "resub_check",   Abc_CommandResubCheck,       0 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "rd_inv",        Abc_CommandRmInverter,       1 );
-    Cmd_CommandAdd(pAbc, "ymc", "pif", Abc_CommandPif, 0);
+    Cmd_CommandAdd(pAbc, "pif", "pif", Abc_CommandPif, 0);
 //    Cmd_CommandAdd( pAbc, "Synthesis",    "rr",            Abc_CommandRr,               1 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "cascade",       Abc_CommandCascade,          1 );
     Cmd_CommandAdd( pAbc, "Synthesis",    "lutcasdec",     Abc_CommandLutCasDec,        1 );

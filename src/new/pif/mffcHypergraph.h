@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ymc
+namespace pif
 {
 	class MffcUnit;
 	class Node;
@@ -124,4 +124,4 @@ namespace ymc
 		std::vector<int64_t> m_partCapacity;
 	};
 
-} // namespace ymc
+} // namespace pif

@@ -18,7 +18,7 @@
 
 ABC_NAMESPACE_USING_NAMESPACE
 
-namespace ymc
+namespace pif
 {
     // Behavior-neutral telemetry. All writes are gated by the
     // PIF_TELEMETRY_DIR env var; when unset no file is opened or written

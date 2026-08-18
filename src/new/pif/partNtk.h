@@ -12,7 +12,7 @@
 
 using std::vector;
 
-namespace ymc
+namespace pif
 {
 	struct PifTimeStats
 	{

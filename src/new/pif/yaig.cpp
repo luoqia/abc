@@ -1,6 +1,6 @@
 #include "yaig.h"
 
-namespace ymc
+namespace pif
 {
 
 	int32_t Yaig::addAndNode(Literal fanin0, Literal fanin1)

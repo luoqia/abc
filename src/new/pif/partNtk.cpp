@@ -13,7 +13,7 @@
 
 using Clock = std::chrono::high_resolution_clock;
 
-namespace ymc
+namespace pif
 {
 	// Task 16 Stage 3 behavior-neutral telemetry (child rows). Gated by
 	// PIF_TELEMETRY_DIR; no file is opened when the variable is unset.
