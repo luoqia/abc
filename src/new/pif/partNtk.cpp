@@ -1334,6 +1334,40 @@ namespace ymc
 			}
 		}
 
+		// Every merge input must be a valid network. In particular, the
+		// small-network path can observe a child that exits successfully but
+		// produces no readable BLIF. Treat that as a child failure here instead
+		// of allowing a null entry to reach Abc_NtkMerge().
+		int nMissingResults = 0;
+		for (size_t i = 0; i < nTasks; i++)
+		{
+			if (m_vSubNtksOptimized[i])
+				continue;
+			nMissingResults++;
+			if (m_fStrict)
+			{
+				ylog("[PIF-STRICT] sub %zu has no optimized result; failing pif per -e.\n", i);
+				continue;
+			}
+
+			m_vSubNtksOptimized[i] = ToAigForm(Abc_NtkDup(m_vSubNtks[i]));
+			if (m_vSubNtksOptimized[i])
+			{
+				m_nChildFallback++;
+				ylog("[Warn] Sub %zu has no optimized result; using original AIG.\n", i);
+			}
+			else
+			{
+				m_fPipelineFailed = true;
+				ylog("[Error] Sub %zu has no optimized result and fallback duplication failed.\n", i);
+			}
+		}
+		if (m_fStrict && nMissingResults > 0)
+		{
+			m_nChildFailure = std::max(m_nChildFailure, nMissingResults);
+			m_fPipelineFailed = true;
+		}
+
 		auto end_total = Clock::now();
 		m_stats.timeOptTotal = std::chrono::duration<double>(end_total - start_total).count();
 		if (m_fPipelineFailed)
@@ -1417,6 +1451,13 @@ namespace ymc
 
 		if (targetNtks.empty())
 			return;
+		if (std::any_of(targetNtks.begin(), targetNtks.end(),
+						[](Abc_Ntk_t *pNtk) { return pNtk == nullptr; }))
+		{
+			ylog("[Error] Refusing to merge a null PIF child result.\n");
+			m_fPipelineFailed = true;
+			return;
+		}
 
 		// 实际子网形式决定合并函数: 全部 STRASH 走 AIG 合并;
 		// 含 logic(映射/SOP) 子网走 mapped 合并 (mapped 合并能处理
