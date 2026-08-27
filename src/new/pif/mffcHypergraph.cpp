@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -79,7 +80,7 @@ namespace ymc
 			char line[256];
 			int64_t hwm = -1;
 			while (fgets(line, sizeof(line), f))
-				if (sscanf(line, "VmHWM: %lld kB", &hwm) == 1)
+				if (sscanf(line, "VmHWM: %" SCNd64 " kB", &hwm) == 1)
 					break;
 			fclose(f);
 			return hwm;
