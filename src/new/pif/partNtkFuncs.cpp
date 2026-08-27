@@ -1,5 +1,6 @@
 #include "partNtkFuncs.h"
 #include <unistd.h>
+#include <cinttypes>
 #include <climits>
 #include <unordered_map>
 #include <string>
@@ -4499,10 +4500,10 @@ namespace pif
 			int nS = std::max(2, (int)((m_vClusters[ci].nNodes + thr - 1) / thr));
 			{
 				char buf[256];
-				snprintf(buf, sizeof(buf), "%d\t%lld\t%d\t%lld\t%d\t%lld",
-						 ci, (long long)m_vClusters[ci].nNodes, (int)thr, nS,
-						 (long long)m_vClusters[ci].iWorkload,
-						 (long long)(m_vClusters[ci].iWorkload / std::max(nS, 1)));
+				snprintf(buf, sizeof(buf), "%d\t%" PRId32 "\t%" PRId64 "\t%d\t%" PRId32 "\t%" PRId64,
+						 ci, m_vClusters[ci].nNodes, thr, nS,
+						 m_vClusters[ci].iWorkload,
+						 (int64_t)m_vClusters[ci].iWorkload / std::max(nS, 1));
 				pifTelemetryRow("pif_split.tsv",
 								"clusterId\tnNodes\tthr\tnSplits\tworkload\tperSplit", buf);
 			}
