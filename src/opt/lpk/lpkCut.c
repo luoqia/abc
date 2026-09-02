@@ -187,6 +187,38 @@ unsigned * Lpk_CutTruth( Lpk_Man_t * p, Lpk_Cut_t * pCut, int fInv )
     Lpk_CutForEachLeaf( p->pNtk, pCut, pObj, i )
         pObj->pCopy = (Abc_Obj_t *)Vec_PtrEntry( p->vTtElems, fInv? pCut->nLeaves-1-i : i );
 
+    // evaluate the window nodes in a deterministic topological order.  The
+    // enumeration stores pNodes in expansion order, which is not topological
+    // under reconvergent fanout (a deep node can enter the frontier early
+    // through one parent while a later-expanded node consumes it), so reverse
+    // iteration could read an unbound/stale fanin truth.  Levels strictly
+    // increase along every internal edge, so sorting pNodes by decreasing
+    // level makes the reverse iteration process each node only after its
+    // fanins; the pivot is the unique highest-level node and stays first.
+    // The stable sort leaves the relative order of equal-level nodes (which
+    // are mutually independent) unchanged, and no consumer outside this
+    // function depends on the expansion order of pNodes.
+    if ( pCut->nNodes > 1 )
+    {
+        int fSwap = 1;
+        while ( fSwap )
+        {
+            fSwap = 0;
+            for ( i = 0; i < (int)pCut->nNodes - 1; i++ )
+            {
+                Abc_Obj_t * pN1 = Abc_NtkObj( p->pNtk, pCut->pNodes[i] );
+                Abc_Obj_t * pN2 = Abc_NtkObj( p->pNtk, pCut->pNodes[i+1] );
+                if ( pN1->Level < pN2->Level )
+                {
+                    int Temp = pCut->pNodes[i];
+                    pCut->pNodes[i] = pCut->pNodes[i+1];
+                    pCut->pNodes[i+1] = Temp;
+                    fSwap = 1;
+                }
+            }
+        }
+    }
+
     // construct truth table in the topological order
     Lpk_CutForEachNodeReverse( p->pNtk, pCut, pObj, i )
     {
@@ -203,7 +235,17 @@ unsigned * Lpk_CutTruth( Lpk_Man_t * p, Lpk_Cut_t * pCut, int fInv )
         // compute the truth table of internal nodes
         pTruth = Lpk_CutTruth_rec( pManHop, pObjHop, pCut->nLeaves, p->vTtNodes, &iCount );
         if ( Hop_IsComplement((Hop_Obj_t *)pObj->pData) )
-            Kit_TruthNot( pTruth, pTruth, pCut->nLeaves );
+        {
+            // never complement a shared truth table in place: for a trivial
+            // (e.g. bare-literal) cone the returned table can alias the shared
+            // elementary tables or a table bound earlier in this evaluation.
+            // Complement a private copy in a fresh slot; each complemented
+            // node consumes at most one additional slot, bounded by nNodes.
+            unsigned * pTruthInv = (unsigned *)Vec_PtrEntry( p->vTtNodes, iCount++ );
+            Kit_TruthCopy( pTruthInv, pTruth, pCut->nLeaves );
+            Kit_TruthNot( pTruthInv, pTruthInv, pCut->nLeaves );
+            pTruth = pTruthInv;
+        }
         // set the truth table at the node
         pObj->pCopy = (Abc_Obj_t *)pTruth;
     }
@@ -359,17 +401,27 @@ static inline int Lpk_NodeCutsOneDominance( Lpk_Cut_t * pDom, Lpk_Cut_t * pCut )
   SeeAlso     []
 
 ***********************************************************************/
-int Lpk_NodeCutsOneFilter( Lpk_Cut_t * pCuts, int nCuts, Lpk_Cut_t * pCutNew )
+int Lpk_NodeCutsOneFilter( Lpk_Man_t * p, Lpk_Cut_t * pCutNew )
 {
+    // The scan iterates the ascending live-cut index pLiveCuts[0..nLiveCuts)
+    // instead of the full storage range.  Entries the reference storage scan
+    // would skip because nLeaves == 0 (cuts removed by earlier dominance
+    // rejections) are never visited, while every live cut is visited in its
+    // identical original storage order, so the comparison sequence, the
+    // duplicate/dominance verdicts, and the removal side effects are exactly
+    // those of the storage scan.
+    Lpk_Cut_t * pCuts = p->pCuts;
     Lpk_Cut_t * pCut;
-    int i, k;
+    int i, k, nLive, pos;
     assert( pCutNew->uSign[0] || pCutNew->uSign[1] );
-    // try to find the cut
-    for ( i = 0; i < nCuts; i++ )
+    // try to find the cut among the live cuts in ascending storage order
+    nLive = p->nLiveCuts;
+    pos = 0;
+    while ( pos < nLive )
     {
+        i = p->pLiveCuts[pos];
         pCut = pCuts + i;
-        if ( pCut->nLeaves == 0 )
-            continue;
+        assert( pCut->nLeaves > 0 );
         if ( pCut->nLeaves == pCutNew->nLeaves )
         {
             if ( pCut->uSign[0] == pCutNew->uSign[0] && pCut->uSign[1] == pCutNew->uSign[1] )
@@ -380,30 +432,55 @@ int Lpk_NodeCutsOneFilter( Lpk_Cut_t * pCuts, int nCuts, Lpk_Cut_t * pCutNew )
                 if ( k == (int)pCutNew->nLeaves )
                     return 1;
             }
+            pos++;
             continue;
         }
         if ( pCut->nLeaves < pCutNew->nLeaves )
         {
             // skip the non-contained cuts
             if ( (pCut->uSign[0] & pCutNew->uSign[0]) != pCut->uSign[0] )
+            {
+                pos++;
                 continue;
+            }
             if ( (pCut->uSign[1] & pCutNew->uSign[1]) != pCut->uSign[1] )
+            {
+                pos++;
                 continue;
+            }
             // check containment seriously
             if ( Lpk_NodeCutsOneDominance( pCut, pCutNew ) )
                 return 1;
+            pos++;
             continue;
         }
         // check potential containment of other cut
 
         // skip the non-contained cuts
         if ( (pCut->uSign[0] & pCutNew->uSign[0]) != pCutNew->uSign[0] )
+        {
+            pos++;
             continue;
+        }
         if ( (pCut->uSign[1] & pCutNew->uSign[1]) != pCutNew->uSign[1] )
+        {
+            pos++;
             continue;
+        }
         // check containment seriously
         if ( Lpk_NodeCutsOneDominance( pCutNew, pCut ) )
+        {
             pCut->nLeaves = 0; // removed
+            // unlink this index from the ascending live list; the next live
+            // index slides into this position and is examined next, exactly
+            // as the reference loop continues from the next storage entry
+            memmove( p->pLiveCuts + pos, p->pLiveCuts + pos + 1,
+                     (nLive - pos - 1) * sizeof(int) );
+            nLive--;
+            p->nLiveCuts = nLive;
+            continue;
+        }
+        pos++;
     }
     return 0;
 }
@@ -543,7 +620,7 @@ void Lpk_NodeCutsOne( Lpk_Man_t * p, Lpk_Cut_t * pCut, int Node )
     }
     // skip the contained cuts
     Lpk_NodeCutSignature( pCutNew );
-    if ( Lpk_NodeCutsOneFilter( p->pCuts, p->nCuts, pCutNew ) )
+    if ( Lpk_NodeCutsOneFilter( p, pCutNew ) )
         return;
 
     // update the set of internal nodes
@@ -572,6 +649,10 @@ void Lpk_NodeCutsOne( Lpk_Man_t * p, Lpk_Cut_t * pCut, int Node )
     // add the cut to storage
     assert( p->nCuts < LPK_CUTS_MAX );
     p->nCuts++;
+    // the new storage entry is live (nonempty), so extend the ascending
+    // live-cut index; new entries always land at the highest storage index
+    assert( p->nLiveCuts < LPK_CUTS_MAX );
+    p->pLiveCuts[p->nLiveCuts++] = p->nCuts - 1;
 }
 
 /**Function*************************************************************
@@ -607,6 +688,30 @@ int Lpk_CountSupp( Abc_Ntk_t * p, Vec_Ptr_t * vNodes )
 
 /**Function*************************************************************
 
+  Synopsis    [Returns 1 if the cut has a leaf that also belongs to the window nodes.]
+
+  Description [Cut enumeration can leave a node listed both among the cut leaves
+  and among the internal window nodes.  Evaluating such a cut reads and commits
+  a truth built over an ambiguous leaf/internal classification, so it is
+  rejected before truth construction or decomposition.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static inline int Lpk_CutHasLeafInWindow( Lpk_Cut_t * pCut )
+{
+    int i, k;
+    for ( i = 0; i < (int)pCut->nNodes; i++ )
+        for ( k = 0; k < (int)pCut->nLeaves; k++ )
+            if ( pCut->pNodes[i] == pCut->pLeaves[k] )
+                return 1;
+    return 0;
+}
+
+/**Function*************************************************************
+
   Synopsis    [Computes the set of all cuts.]
 
   Description []
@@ -636,12 +741,15 @@ int Lpk_NodeCuts( Lpk_Man_t * p )
 */
     // initialize the first cut
     pCut = p->pCuts; p->nCuts = 1;
-    pCut->nNodes = 0; 
+    pCut->nNodes = 0;
     pCut->nNodesDup = 0;
     pCut->nLeaves = 1;
     pCut->pLeaves[0] = p->pObj->Id;
     // assign the signature
     Lpk_NodeCutSignature( pCut );
+    // the live-cut index starts with the single initial cut
+    p->nLiveCuts = 1;
+    p->pLiveCuts[0] = 0;
 
     // perform the cut computation
     for ( i = 0; i < p->nCuts; i++ )
@@ -675,6 +783,10 @@ int Lpk_NodeCuts( Lpk_Man_t * p )
     {
         pCut = p->pCuts + i;
         if ( pCut->nLeaves < 2 )
+            continue;
+        // reject a cut whose leaf set intersects its internal-node set:
+        // never construct its truth or decompose it
+        if ( Lpk_CutHasLeafInWindow( pCut ) )
             continue;
         // compute the minimum number of LUTs needed to implement this cut
         // V = N * (K-1) + 1  ~~~~~  N = Ceiling[(V-1)/(K-1)] = (V-1)/(K-1) + [(V-1)%(K-1) > 0]

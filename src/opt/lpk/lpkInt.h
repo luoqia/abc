@@ -80,7 +80,9 @@ struct Lpk_Man_t_
     int          nEvals;                // the number of good cuts
     Lpk_Cut_t    pCuts[LPK_CUTS_MAX];   // the storage for cuts
     int          pEvals[LPK_CUTS_MAX];  // the good cuts
-    // visited nodes 
+    int          pLiveCuts[LPK_CUTS_MAX]; // ascending indices of nonempty cuts
+    int          nLiveCuts;               // number of nonempty cuts in pCuts
+    // visited nodes
     Vec_Vec_t *  vVisited;
     // mapping manager
     If_Man_t *   pIfMan;
