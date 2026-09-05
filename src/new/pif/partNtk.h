@@ -6,7 +6,7 @@
 #include <numeric>
 #include "base/abc/abc.h"
 #include <sys/time.h>
-#include <linux/limits.h> // PATH_MAX
+#include <limits.h> // PATH_MAX
 
 #include "new/pif/partNtkFuncs.h"
 
