@@ -39,6 +39,8 @@
 #include "proof/int/int.h"
 #include "proof/dch/dch.h"
 #include "new/dch2/dch2.h"
+#include <errno.h>
+#include <limits.h>
 #include "proof/ssw/ssw.h"
 #include "opt/cgt/cgt.h"
 #include "bool/kit/kit.h"
@@ -18991,25 +18993,35 @@ int Abc_CommandDch2( Abc_Frame_t * pAbc, int argc, char ** argv )
     Extra_UtilGetoptReset();
     while ( (c = Extra_UtilGetopt( argc, argv, "j:W:S:H:C:vh" )) != EOF )
     {
+        int value = 0;
+        if ( c == 'j' || c == 'W' || c == 'H' || c == 'S' || c == 'C' )
+        {
+            char * end;
+            errno = 0;
+            long parsed = strtol( globalUtilOptarg, &end, 10 );
+            if ( !*globalUtilOptarg || end == globalUtilOptarg || *end || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX )
+            { Abc_Print( -1, "Invalid integer for dch2 -%c: %s\n", c, globalUtilOptarg ); return 1; }
+            value = (int)parsed;
+        }
         switch ( c )
         {
         case 'j':
-            pPars->nThreads = atoi(globalUtilOptarg);
-            if ( pPars->nThreads < 1 ) { Abc_Print( -1, "The number of workers must be at least 1.\n" ); return 1; }
+            pPars->nThreads = value;
+            if ( pPars->nThreads < 1 || pPars->nThreads > 16 ) { Abc_Print( -1, "The number of workers must be between 1 and 16.\n" ); return 1; }
             break;
         case 'W':
-            pPars->nWinSize = atoi(globalUtilOptarg);
+            pPars->nWinSize = value;
             if ( pPars->nWinSize < 10 ) { Abc_Print( -1, "The window size must be at least 10.\n" ); return 1; }
             break;
         case 'H':
-            pPars->nHalo = atoi(globalUtilOptarg);
+            pPars->nHalo = value;
             if ( pPars->nHalo < 0 ) { Abc_Print( -1, "The halo size cannot be negative.\n" ); return 1; }
             break;
         case 'S':
-            pPars->nSeed = atoi(globalUtilOptarg);
+            pPars->nSeed = value;
             break;
         case 'C':
-            pPars->nConfMax = atoi(globalUtilOptarg);
+            pPars->nConfMax = value;
             if ( pPars->nConfMax < 0 ) { Abc_Print( -1, "The conflict limit cannot be negative.\n" ); return 1; }
             break;
         case 'v':
@@ -19030,7 +19042,7 @@ int Abc_CommandDch2( Abc_Frame_t * pAbc, int argc, char ** argv )
     return 0;
 usage:
     Abc_Print( -2, "usage: dch2 [-j <num>] [-W <num>] [-H <num>] [-S <num>] [-C <num>] [-vh]\n" );
-    Abc_Print( -2, "\t           deterministic windowed choice construction (Task 42 DCH2)\n" );
+    Abc_Print( -2, "\t           deterministic windowed choice construction\n" );
     Abc_Print( -2, "\t-j <num> : the number of workers (1..16) [default = %d]\n", pPars->nThreads );
     Abc_Print( -2, "\t-W <num> : the number of nodes per window [default = %d]\n", pPars->nWinSize );
     Abc_Print( -2, "\t-H <num> : the halo size on each side of a window [default = %d]\n", pPars->nHalo );
