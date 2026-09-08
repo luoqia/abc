@@ -8,7 +8,7 @@
 #include <fcntl.h>
 #include <cstdio>
 #include <sys/stat.h>
-#include <linux/limits.h> // PATH_MAX
+#include <limits.h> // PATH_MAX
 #include <libgen.h>		  // dirname
 
 using Clock = std::chrono::high_resolution_clock;
