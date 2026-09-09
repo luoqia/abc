@@ -101,6 +101,11 @@ struct Lpk_ParCtx_t_
     Lpk_ParMemo_t * Memo;
     int         nMemo;
     unsigned    MemoEpoch;
+    // Task 80 F3 closure: per-worker debug counters (the rev-1 code
+    // incremented process-global counters from worker threads).
+    int         nDbgEvals;
+    int         nDbgGate;
+    int         nDbgDec;
 };
 
 typedef struct Lpk_ParPass_t_
@@ -115,6 +120,9 @@ typedef struct Lpk_ParPass_t_
     int            nWorkers;
     int            nChunks;
     int            NextChunk;   // atomic
+    int            nDbgEvals;   // summed per-worker counters (F3)
+    int            nDbgGate;
+    int            nDbgDec;
 } Lpk_ParPass_t;
 
 ////////////////////////////////////////////////////////////////////////
@@ -464,36 +472,19 @@ static int Lpk_ParNodeCuts( Lpk_ParCtx_t * pC, Lpk_Man_t * p )
             }
         }
     }
-    // saturation impact: replace vVisited[pivot] with the unique leaves
+    // saturation impact: replace vVisited[pivot] with the unique leaves.
+    // Task 80 F2 closure: this must NOT clear vWinCur (the full window
+    // union recorded above); the leaf impact list is built from vLeafCur
+    // (already deduplicated, with (id, level) pairs) into a separate list.
     if ( p->pPars->fSatur )
     {
-        pC->GenU++;
-        if ( pC->GenU == 0 )
-        {
-            memset( pC->pUG, 0, sizeof(int) * pC->nMarkSize );
-            pC->GenU = 1;
-        }
-        Vec_IntClear( pC->vWinCur );
-        for ( i = 0; i < p->nCuts; i++ )
-        {
-            pCut = p->pCuts + i;
-            if ( pCut->nLeaves == 0 )
-                continue;
-            for ( k = 0; k < (int)pCut->nLeaves; k++ )
-            {
-                v = pCut->pLeaves[k];
-                if ( pC->pUG[v] != pC->GenU )
-                {
-                    pC->pUG[v] = pC->GenU;
-                    Vec_IntPush( pC->vWinCur, v );
-                }
-            }
-        }
         vNodes = Vec_VecEntry( pC->pShared->vVisited, p->pObj->Id );
         Vec_PtrClear( vNodes );
-        Vec_IntForEachEntry( pC->vWinCur, v, k )
+        for ( i = 0; i < Vec_IntSize(pC->vLeafCur); i += 2 )
         {
+            v = Vec_IntEntry( pC->vLeafCur, i );
             pNode = Abc_NtkObj( p->pNtk, v );
+            assert( pNode != NULL );
             Vec_PtrPush( vNodes, (void *)(ABC_PTRUINT_T)pNode->Id );
             Vec_PtrPush( vNodes, (void *)(ABC_PTRUINT_T)Abc_ObjFanoutNum(pNode) );
         }
@@ -568,11 +559,21 @@ static unsigned * Lpk_ParSim_rec( Lpk_ParSim_t * s, Hop_Obj_t * pLit )
         assert( !Abc_ObjIsComplement(pFan) );
         return Lpk_ParFaninTruth( s, pFan->Id );
     }
+    // Task 80 F4 closure: entries whose Epoch is stale are dead and their
+    // slot is immediately reusable.  Only entries created in the CURRENT
+    // window-node simulation epoch are live, and one window-node cone is
+    // bounded by LPK_SIZE_MAX (<= 100) objects, far below nMemo, so the
+    // probe terminates at the first reusable slot (NULL key or stale epoch)
+    // and can never loop without bound on a full table of stale keys.
     h = (unsigned)((ABC_PTRUINT_T)pObjR >> 4) & (s->pC->nMemo - 1);
-    while ( s->pC->Memo[h].pKey != NULL && s->pC->Memo[h].pKey != pObjR )
+    for ( ; ; )
+    {
+        if ( s->pC->Memo[h].pKey == NULL || s->pC->Memo[h].Epoch != s->pC->MemoEpoch )
+            break;
+        if ( s->pC->Memo[h].pKey == pObjR )
+            return s->pC->Memo[h].pVal;
         h = (h + 1) & (s->pC->nMemo - 1);
-    if ( s->pC->Memo[h].pKey == pObjR && s->pC->Memo[h].Epoch == s->pC->MemoEpoch )
-        return s->pC->Memo[h].pVal;
+    }
     if ( Hop_ObjIsConst1(pObjR) )
     {
         pTruth = (unsigned *)Vec_PtrEntry( s->p->vTtNodes, s->iCount++ );
@@ -581,11 +582,17 @@ static unsigned * Lpk_ParSim_rec( Lpk_ParSim_t * s, Hop_Obj_t * pLit )
     else
     {
         assert( Hop_ObjIsAnd(pObjR) );
+        // Task 80 F1 closure: the child phase belongs to the RAW child edge,
+        // not to the regularized fanin.  Hop_ObjFanin0/1 regularize, so
+        // Hop_IsComplement(Hop_ObjFanin0(p)) was always 0 and complemented
+        // AND-input edges lost their polarity.  Mirror the serial reference
+        // lpkCut.c:155-158: recurse on the regular fanin, pass the raw-edge
+        // complement flags (Hop_ObjFaninC0/C1) to Kit_TruthAndPhase.
         pT0 = Lpk_ParSim_rec( s, Hop_ObjFanin0(pObjR) );
         pT1 = Lpk_ParSim_rec( s, Hop_ObjFanin1(pObjR) );
         pTruth = (unsigned *)Vec_PtrEntry( s->p->vTtNodes, s->iCount++ );
         Kit_TruthAndPhase( pTruth, pT0, pT1, s->pCut->nLeaves,
-            Hop_IsComplement(Hop_ObjFanin0(pObjR)), Hop_IsComplement(Hop_ObjFanin1(pObjR)) );
+            Hop_ObjFaninC0(pObjR), Hop_ObjFaninC1(pObjR) );
     }
     s->pC->Memo[h].pKey = pObjR;
     s->pC->Memo[h].pVal = pTruth;
@@ -775,7 +782,6 @@ static Lpk_ParRec_t * Lpk_ParRecAlloc( void );
    fills the evaluation record for the pivot p->pObj. */
 static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** ppRecOut )
 {
-    extern int lpk_par_dbg_evals, lpk_par_dbg_gate, lpk_par_dbg_dec;
     Lpk_Cut_t * pCut;
     unsigned * pTruth;
     abctime clk;
@@ -851,7 +857,7 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
         }
     }
     // try the good cuts in weight order
-    lpk_par_dbg_evals += p->nEvals;
+    pC->nDbgEvals += p->nEvals;
     for ( i = 0; i < p->nEvals; i++ )
     {
         pCut = p->pCuts + p->pEvals[i];
@@ -877,7 +883,7 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
         }
         if ( nCutNodes != (int)pCut->nNodes - (int)pCut->nNodesDup )
             continue;
-        lpk_par_dbg_gate++;
+        pC->nDbgGate++;
         Vec_PtrClear( vLeaves );
         for ( k = 0; k < (int)pCut->nLeaves; k++ )
             Vec_PtrPush( vLeaves, Abc_NtkObj( p->pNtk, pCut->pLeaves[k]) );
@@ -915,7 +921,7 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
         Lpk_ParComputeSupports( p, pC, pCut, pTruth );
         p->timeSupps += Abc_Clock() - clk;
         clk = Abc_Clock();
-        lpk_par_dbg_dec++;
+        pC->nDbgDec++;
         if ( Lpk_ParDecomposePlan( p, vLeaves, pTruth, p->puSupps, p->pPars->nLutSize,
                 (int)pCut->nNodes - (int)pCut->nNodesDup - 1 + (int)(p->pPars->fZeroCost > 0), Required, nLeavesOld, pRec ) )
         {
@@ -1092,6 +1098,9 @@ static void Lpk_ParAggregate( Lpk_ParPass_t * pPass, Lpk_ParCtx_t * pC )
     p->timeTruth += pW->timeTruth;
     p->timeSupps += pW->timeSupps;
     p->timeEval += pW->timeEval;
+    pPass->nDbgEvals += pC->nDbgEvals;
+    pPass->nDbgGate += pC->nDbgGate;
+    pPass->nDbgDec += pC->nDbgDec;
 }
 
 /* run the parallel evaluation phase */
@@ -1191,6 +1200,25 @@ static int Lpk_ParDrifted( Lpk_ParPass_t * pPass, Lpk_ParRec_t * pRec, int vPivo
     pObj = Abc_NtkObj( pNtk, vPivot );
     if ( pObj == NULL || Abc_ObjRequiredLevel(pObj) != pRec->Required )
         return 1;
+    // Task 80 F2 closure: even when every recorded id is alive, an earlier
+    // serial commit can have attached NEW consumers to window-interior
+    // nodes (new nodes get fresh ids, so the interior ids still exist).
+    // The live MFFC-with-cut gate must therefore be re-run before a plan
+    // commit: it is exactly the serial eval-time gate (leaf fanout bump +
+    // Abc_NodeMffcLabel).  Interior nodes with an outside consumer survive
+    // deletion, so a stale plan would otherwise overstate the gain.
+    if ( pRec->fPlan )
+    {
+        extern int Abc_NodeMffcLabel( Abc_Obj_t * pNode, Vec_Ptr_t * vNodes );
+        int nCutNodes, k;
+        for ( k = 0; k < pRec->nLeaves; k++ )
+            Abc_NtkObj(pNtk, pRec->pLeafIds[k])->vFanouts.nSize++;
+        nCutNodes = Abc_NodeMffcLabel( pObj, NULL );
+        for ( k = 0; k < pRec->nLeaves; k++ )
+            Abc_NtkObj(pNtk, pRec->pLeafIds[k])->vFanouts.nSize--;
+        if ( nCutNodes != pRec->nNodes - pRec->nNodesDup )
+            return 1;
+    }
     return 0;
 }
 
@@ -1374,7 +1402,6 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
     Lpk_ParCommitPhase( &Pass );
     if ( getenv("LUTPACK_DEBUG") )
     {
-        extern int lpk_par_dbg_evals, lpk_par_dbg_gate, lpk_par_dbg_dec;
         int nEnum = 0, nPlan = 0, nComm = 0;
         for ( v = 0; v < nNodes; v++ )
             if ( Pass.ppRecs[v] )
@@ -1386,9 +1413,8 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
                     nComm++;
             }
         printf( "[lpkpar] pass pivots=%d enum=%d plan=%d committed=%d evals=%d gate_ok=%d dec_try=%d cuts_total=%d cuts_useful=%d\n",
-            Pass.nPivots, nEnum, nPlan, nComm, lpk_par_dbg_evals, lpk_par_dbg_gate, lpk_par_dbg_dec,
+            Pass.nPivots, nEnum, nPlan, nComm, Pass.nDbgEvals, Pass.nDbgGate, Pass.nDbgDec,
             p->nCutsTotal, p->nCutsUseful );
-        lpk_par_dbg_evals = lpk_par_dbg_gate = lpk_par_dbg_dec = 0;
     }
     // release records
     for ( v = 0; v < nNodes; v++ )
@@ -1404,7 +1430,5 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
     (void)i;
 }
 
-
-int lpk_par_dbg_evals = 0, lpk_par_dbg_gate = 0, lpk_par_dbg_dec = 0;
 
 ABC_NAMESPACE_IMPL_END
