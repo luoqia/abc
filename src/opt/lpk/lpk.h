@@ -53,6 +53,7 @@ struct Lpk_Par_t_
     int               fOldAlgo;      // use old algorithm
     int               fVerbose;      // the verbosiness flag
     int               fVeryVerbose;  // additional verbose info printout
+    int               nWorkers;      // private-window parallel workers (1 = original serial path)
     // internal parameters
     int               nLutSize;      // (K) the LUT size (determined by the input network)
     int               nVarsMax;      // (V) the largest number of variables: V = N * (K-1) + 1

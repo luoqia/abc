@@ -451,10 +451,10 @@ Kit_DsdPrint( stdout, pNtks[i] );
 ***********************************************************************/
 Lpk_Res_t * Lpk_DsdAnalize( Lpk_Man_t * pMan, Lpk_Fun_t * p, int nShared )
 { 
-    static Lpk_Res_t Res0, * pRes0 = &Res0;
-    static Lpk_Res_t Res1, * pRes1 = &Res1;
-    static Lpk_Res_t Res2, * pRes2 = &Res2;
-    static Lpk_Res_t Res3, * pRes3 = &Res3;
+    Lpk_Res_t * pRes0 = pMan->pResDsd + 0;
+    Lpk_Res_t * pRes1 = pMan->pResDsd + 1;
+    Lpk_Res_t * pRes2 = pMan->pResDsd + 2;
+    Lpk_Res_t * pRes3 = pMan->pResDsd + 3;
     int fUseBackLooking = 1;
     Lpk_Res_t * pRes = NULL;
     Vec_Int_t * vBSets;

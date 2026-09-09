@@ -44,7 +44,7 @@ ABC_NAMESPACE_IMPL_START
 ***********************************************************************/
 Lpk_Res_t * Lpk_MuxAnalize( Lpk_Man_t * pMan, Lpk_Fun_t * p )
 {
-    static Lpk_Res_t Res, * pRes = &Res;
+    Lpk_Res_t * pRes = &pMan->pResMux;
     int nSuppSize0, nSuppSize1, nSuppSizeS, nSuppSizeL;
     int Var, Area, Polarity, Delay, Delay0, Delay1, DelayA, DelayB;
     memset( pRes, 0, sizeof(Lpk_Res_t) );

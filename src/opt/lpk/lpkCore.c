@@ -665,6 +665,14 @@ int Lpk_Resynthesize( Abc_Ntk_t * pNtk, Lpk_Par_t * pPars )
 
         // consider all nodes
         nNodes = Abc_NtkObjNumMax(pNtk);
+        if ( ( p->pPars->nWorkers > 1 || getenv("LUTPACK_FORCEPAR") ) && !pPars->fOldAlgo && !pPars->fVeryVerbose
+             && Abc_NtkNodeNum(pNtk) > 1000 )
+        {
+            // private-window parallel evaluation + serial validated commits
+            Lpk_PassPar( p, nNodes, p->pPars->nWorkers );
+        }
+        else
+        {
         if ( !pPars->fVeryVerbose )
             pProgress = Extra_ProgressBarStart( stdout, nNodes );
         Abc_NtkForEachNode( pNtk, pObj, i )
@@ -691,8 +699,12 @@ int Lpk_Resynthesize( Abc_Ntk_t * pNtk, Lpk_Par_t * pPars )
         }
         if ( !pPars->fVeryVerbose )
             Extra_ProgressBarStop( pProgress );
+        }
 
         // check the increase
+        if ( getenv("LUTPACK_DEBUG") )
+            printf( "[lpkpar] SERIAL pass done: changes=%d nodes_now=%d\n",
+                p->nChanges, Abc_NtkNodeNum(pNtk) );
         Delta = 100.00 * (nNodesPrev - Abc_NtkNodeNum(pNtk)) / p->nNodesTotal;
         if ( Delta < 0.05 )
             break;

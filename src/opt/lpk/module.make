@@ -1,4 +1,5 @@
 SRC +=    src/opt/lpk/lpkCore.c \
+    src/opt/lpk/lpkPar.c \
     src/opt/lpk/lpkAbcDec.c \
     src/opt/lpk/lpkAbcMux.c \
     src/opt/lpk/lpkAbcDsd.c \

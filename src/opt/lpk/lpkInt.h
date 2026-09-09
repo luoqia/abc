@@ -66,6 +66,23 @@ struct Lpk_Cut_t_
     int          pNodes[LPK_SIZE_MAX];  // the nodes of the cut
 };
 
+// preliminary decomposition result (defined before Lpk_Man_t because the
+// manager embeds per-worker result slots)
+typedef struct Lpk_Res_t_ Lpk_Res_t;
+struct Lpk_Res_t_
+{
+    int          nBSVars;          // the number of bound set variables
+    unsigned     BSVars;           // the bound set
+    int          nCofVars;         // the number of cofactoring variables
+    char         pCofVars[4];      // the cofactoring variables
+    int          nSuppSizeS;       // support size of the smaller (decomposed) function
+    int          nSuppSizeL;       // support size of the larger (composition) function
+    int          DelayEst;         // estimated delay of the decomposition
+    int          AreaEst;          // estimated area of the decomposition
+    int          Variable;         // variable in MUX decomposition
+    int          Polarity;         // polarity in MUX decomposition
+};
+
 struct Lpk_Man_t_
 {
     // parameters
@@ -123,6 +140,7 @@ struct Lpk_Man_t_
     int          nTotalNodes2;
     // counter of non-DSD blocks
     int          nBlocks[17];
+    int          nPivots;               // pivots offered to resynthesis
     // runtime
     abctime      timeCuts;
     abctime      timeTruth;
@@ -138,7 +156,10 @@ struct Lpk_Man_t_
     abctime      timeEvalMuxSp;
     abctime      timeEvalDsdAn;
     abctime      timeEvalDsdSp;
- 
+    // per-manager decomposition-result slots (thread-local per worker)
+    Lpk_Res_t    pResDsd[4];
+    Lpk_Res_t    pResMux;
+
 };
 
 
@@ -158,23 +179,7 @@ struct Lpk_Fun_t_
     unsigned     nDelayLim;        // the delay limit (the largest allowed)
     int          pDelays[16];      // the delays of the inputs
     char         pFanins[16];      // the fanins of this function
-    unsigned     pTruth[0];        // the truth table (contains room for three truth tables)    
-};
-
-// preliminary decomposition result
-typedef struct Lpk_Res_t_ Lpk_Res_t;
-struct Lpk_Res_t_
-{
-    int          nBSVars;          // the number of bound set variables
-    unsigned     BSVars;           // the bound set
-    int          nCofVars;         // the number of cofactoring variables
-    char         pCofVars[4];      // the cofactoring variables
-    int          nSuppSizeS;       // support size of the smaller (decomposed) function 
-    int          nSuppSizeL;       // support size of the larger (composition) function
-    int          DelayEst;         // estimated delay of the decomposition
-    int          AreaEst;          // estimated area of the decomposition
-    int          Variable;         // variable in MUX decomposition
-    int          Polarity;         // polarity in MUX decomposition
+    unsigned     pTruth[0];        // the truth table (contains room for three truth tables)
 };
 
 static inline int        Lpk_LutNumVars( int nLutsLim, int nLutK ) { return  nLutsLim * (nLutK - 1) + 1;                                            }
@@ -228,6 +233,8 @@ extern int            Lpk_NodeCuts( Lpk_Man_t * p );
 /*=== lpkMap.c =========================================================*/
 extern Lpk_Man_t *    Lpk_ManStart( Lpk_Par_t * pPars );
 extern void           Lpk_ManStop( Lpk_Man_t * p );
+/*=== lpkPar.c ============================================================*/
+extern void           Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers );
 /*=== lpkMap.c =========================================================*/
 extern If_Obj_t *     Lpk_MapPrime( Lpk_Man_t * p, unsigned * pTruth, int nVars, If_Obj_t ** ppLeaves );
 extern If_Obj_t *     Lpk_MapTree_rec( Lpk_Man_t * p, Kit_DsdNtk_t * pNtk, If_Obj_t ** ppLeaves, int iLit, If_Obj_t * pResult );

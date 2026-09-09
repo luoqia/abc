@@ -5482,6 +5482,18 @@ int Abc_CommandLutpack( Abc_Frame_t * pAbc, int argc, char ** argv )
     pPars->fOldAlgo     =  0;
     pPars->fVerbose     =  0;
     pPars->fVeryVerbose =  0;
+    // Private-window parallel worker count; default 1 = original serial path.
+    // Read from the environment only so the ABC recipe text stays identical
+    // between the A (serial) and C (parallel) comparator runs.
+    pPars->nWorkers     =  1;
+    if ( getenv("LUTPACK_WORKERS") )
+    {
+        int nWorkers = atoi( getenv("LUTPACK_WORKERS") );
+        if ( nWorkers < 1 || nWorkers > 64 )
+            Abc_Print( -1, "LUTPACK_WORKERS should be between 1 and 64.\n" );
+        else
+            pPars->nWorkers = nWorkers;
+    }
     Extra_UtilGetoptReset();
     while ( ( c = Extra_UtilGetopt( argc, argv, "NQSLszfovwh" ) ) != EOF )
     {
