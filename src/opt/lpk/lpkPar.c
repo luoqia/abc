@@ -1189,24 +1189,21 @@ static void Lpk_ParWorkerChunk( Lpk_ParPass_t * pPass, Lpk_ParCtx_t * pC, int iC
         Lpk_ParRec_t * pRec = NULL;
         long nBytes;
         v = pPass->vPivots[i];
-        // Task 81 Q1: hard retention bound.  Once this worker's share of the
-        // pass budget is spent, the remaining pivots are deferred: the commit
-        // phase re-evaluates them serially on the live network, which is
-        // exactly what the serial sweep does at that point, so results are
-        // unchanged while retained memory stays bounded.
-        if ( pC->RetainedBytes >= pC->RetainBudget )
-        {
-            pPass->pDeferred[v] = 1;
-            pC->nDeferred++;
-            continue;
-        }
         pC->pMan->pObj = Abc_NtkObj( pPass->pNtk, v );
         assert( pC->pMan->pObj && Abc_ObjIsNode(pC->pMan->pObj) );
+        // Task 81 Q1: the retention bound limits what is KEPT, never what is
+        // evaluated.  Evaluation stays parallel for every pivot; a record
+        // that does not fit this worker's share of the budget is released
+        // immediately and only that pivot falls back to the serial commit
+        // sweep (which is the serial algorithm's own behaviour at that point,
+        // so results are unchanged).  Bounding the retention by skipping
+        // evaluation entirely would silence the parallel engine for the rest
+        // of the pass and is deliberately not done here.
         Lpk_ParEvalPivot( pC, pC->pMan, &pRec );
         if ( pRec == NULL )
             continue;   // MFFC==1 pivot: nothing to retain or commit
         nBytes = Lpk_ParRecBytes( pRec );
-        if ( pC->RetainedBytes + nBytes > pC->RetainBudget && pC->nRetainedRecs > 0 )
+        if ( pC->RetainedBytes + nBytes > pC->RetainBudget )
         {
             Lpk_ParRecFree( pRec );
             pPass->pDeferred[v] = 1;
@@ -1554,8 +1551,8 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
     {
         long nMarkSize = (long)Abc_NtkObjNumMax(pNtk) + 1;
         long nScratchPerWorker = 3L * (long)sizeof(int) * nMarkSize;
-        long nScratchBudget = 2048L * 1024L * 1024L;
-        long nRetainBudget = 512L * 1024L * 1024L;
+        long nScratchBudget = 4096L * 1024L * 1024L;
+        long nRetainBudget = 4096L * 1024L * 1024L;
         long nMaxWorkers;
         if ( getenv("LUTPACK_SCRATCH_MB") )
         {
