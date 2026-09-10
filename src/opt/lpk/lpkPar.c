@@ -79,6 +79,13 @@ typedef struct Lpk_ParRec_t_
     Vec_Int_t *  vWin;         // window interior ids read by enumeration
     Vec_Int_t *  vLeaves;      // (id, level) pairs of every enumerated leaf
     unsigned *   pTruth;       // lutmin plan: truth words
+    // Task 81 Q1: 64-bit structural fingerprint of every window/leaf node and
+    // its fanin edges, recomputed at commit time.  Together with the network's
+    // append-only id rule (abcObj.c: pObj->Id = vObjs->nSize, deleted slots are
+    // NULLed and never recycled) and node immutability under lutpack commit
+    // (nodes are created/deleted, never edited in place) this binds the
+    // detached plan's function, boundary and dependencies to the live graph.
+    ABC_UINT64_T uFp;
 } Lpk_ParRec_t;
 
 typedef struct Lpk_ParCtx_t_ Lpk_ParCtx_t;
@@ -106,6 +113,15 @@ struct Lpk_ParCtx_t_
     int         nDbgEvals;
     int         nDbgGate;
     int         nDbgDec;
+    // Task 81 Q1 storage admission: this worker's share of the pass retention
+    // budget, and what it currently holds.  A per-worker share makes the
+    // global bound provable without atomics: total <= nWorkers * per-worker.
+    long        RetainBudget;
+    long        RetainedBytes;
+    int         nRetainedRecs;
+    int         nDeferred;
+    // number of Pivots/LUTPACK_DEBUG3 probes actually run (see the probe gate)
+    int         nWorkers;
 };
 
 typedef struct Lpk_ParPass_t_
@@ -123,6 +139,21 @@ typedef struct Lpk_ParPass_t_
     int            nDbgEvals;   // summed per-worker counters (F3)
     int            nDbgGate;
     int            nDbgDec;
+    // Task 81 Q1: retention bound.  Pivots whose evaluation would exceed the
+    // budget are deferred to the serial commit path, which re-evaluates them
+    // on the live network exactly as the serial algorithm would at that point
+    // in the sweep, so results are unchanged and the bound is hard.
+    char *         pDeferred;   // per-node-id deferred bitmap
+    long           PlanCapBytes;
+    long           RetainBudgetPerWorker;
+    long           ScratchBytes;      // global-id scratch (reported separately)
+    long           WindowBytesMax;    // bounded active-window storage
+    // commit-phase accounting
+    int            nCommittedNew;     // accepted replacements via a parallel plan
+    int            nCommittedSerial;  // accepted after serial re-evaluation
+    int            nDeferredPivots;
+    int            nDriftedPivots;
+    int            nSelftestFp;       // LUTPACK_SELFTEST_FP corruptions applied
 } Lpk_ParPass_t;
 
 ////////////////////////////////////////////////////////////////////////
@@ -132,6 +163,48 @@ typedef struct Lpk_ParPass_t_
 static inline int Lpk_ParIsMember( Lpk_ParCtx_t * pC, int v )
 {
     return pC->pCntGen[v] == pC->GenDrain && pC->pCnt[v] == 0;
+}
+
+/* ---- Task 81 Q1: live-context structural fingerprint -------------------
+   The network's object ids are append-only: Abc_NtkObjAlloc assigns
+   pObj->Id = pNtk->vObjs->nSize and pushes (abcObj.c:114-115); deletion
+   writes NULL into the slot (abcObj.c:189,258) and never recycles it.  A
+   live recorded id therefore still denotes the object that was evaluated,
+   and lutpack's commit path only creates and deletes nodes - it never edits
+   a live node's fanin edges.  The fingerprint re-reads every recorded
+   window/leaf node's *current* fanin edge structure; any in-place mutation
+   or id recycling would change it and force a serial re-evaluation. */
+static ABC_UINT64_T Lpk_ParFpMix( ABC_UINT64_T h, ABC_UINT64_T v )
+{
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+
+static ABC_UINT64_T Lpk_ParFpAddNode( ABC_UINT64_T h, Abc_Ntk_t * pNtk, int v )
+{
+    Abc_Obj_t * pObj = Abc_NtkObj( pNtk, v );
+    int nFanin, f0 = -1, f1 = -1, c0 = 0, c1 = 0;
+    if ( pObj == NULL )
+        return Lpk_ParFpMix( h, 0xdeadbeefULL );
+    nFanin = Abc_ObjFaninNum( pObj );
+    if ( nFanin > 0 ) { f0 = Abc_ObjFaninId0(pObj); c0 = Abc_ObjFaninC0(pObj); }
+    if ( nFanin > 1 ) { f1 = Abc_ObjFaninId1(pObj); c1 = Abc_ObjFaninC1(pObj); }
+    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)v );
+    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)f0 );
+    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)f1 );
+    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)(nFanin * 4 + c0 * 2 + c1) );
+    return h;
+}
+
+static ABC_UINT64_T Lpk_ParFingerprint( Abc_Ntk_t * pNtk, Lpk_ParRec_t * pRec )
+{
+    ABC_UINT64_T h = 0x0123456789abcdefULL;
+    int i, v;
+    Vec_IntForEachEntry( pRec->vWin, v, i )
+        h = Lpk_ParFpAddNode( h, pNtk, v );
+    for ( i = 0; i < Vec_IntSize(pRec->vLeaves); i += 2 )
+        h = Lpk_ParFpAddNode( h, pNtk, Vec_IntEntry(pRec->vLeaves, i) );
+    return h;
 }
 
 static inline int Lpk_ParCutHasLeafInWindow( Lpk_Cut_t * pCut )
@@ -339,7 +412,19 @@ static int Lpk_ParNodeCuts( Lpk_ParCtx_t * pC, Lpk_Man_t * p )
     pC->pCntGen[p->pObj->Id] = pC->GenDrain;
     pC->pCnt[p->pObj->Id] = 0;
     p->nMffc = nMffc;
-    if ( getenv("LUTPACK_DEBUG2") && pC->iWorker == 0 && nMffc > 1 )
+    // Task 81 Q1: the serial-comparison probes mutate shared network traversal
+    // marks, so they are admitted only in single-worker mode; requesting them
+    // in threaded mode is rejected loudly rather than run unsafely.
+    if ( getenv("LUTPACK_DEBUG2") && pC->nWorkers > 1 )
+    {
+        static int fWarned2 = 0;
+        if ( !fWarned2 )
+        {
+            printf( "[lpkpar] LUTPACK_DEBUG2 requires single-worker mode; probe disabled (set LUTPACK_WORKERS=1)\n" );
+            fWarned2 = 1;
+        }
+    }
+    if ( getenv("LUTPACK_DEBUG2") && pC->nWorkers == 1 && pC->iWorker == 0 && nMffc > 1 )
     {
         extern int Abc_NodeMffcLabel( Abc_Obj_t * pNode, Vec_Ptr_t * vNodes );
         static int fProbed = 0;
@@ -800,9 +885,19 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
     pRec->Required = Required;
     Vec_IntAppend( pRec->vWin, pC->vWinCur );
     Vec_IntAppend( pRec->vLeaves, pC->vLeafCur );
+    pRec->uFp = Lpk_ParFingerprint( p->pNtk, pRec );
     p->nCutsTotal += p->nCuts;
     p->nCutsUseful += p->nEvals;
-    if ( getenv("LUTPACK_DEBUG3") )
+    if ( getenv("LUTPACK_DEBUG3") && pC->nWorkers > 1 )
+    {
+        static int fWarned3 = 0;
+        if ( !fWarned3 )
+        {
+            printf( "[lpkpar] LUTPACK_DEBUG3 requires single-worker mode; probe disabled (set LUTPACK_WORKERS=1)\n" );
+            fWarned3 = 1;
+        }
+    }
+    if ( getenv("LUTPACK_DEBUG3") && pC->nWorkers == 1 )
     {
         extern int Lpk_NodeCuts( Lpk_Man_t * p );
         static int fProbe = 0, nProbed = 0, nEnumSeen = 0;
@@ -810,11 +905,19 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
         if ( !fProbe && (nEnumSeen % 500 == 1) && nProbed < 60 )
         {
             Lpk_Man_t * pS = Lpk_ManStart( p->pPars );
+            int fSaturSaved;
             pS->pNtk = p->pNtk;
             pS->pObj = p->pObj;
+            // Task 81 Q1 thread-safety: Lpk_ManStart stores the shared pPars
+            // pointer, so the probe must (a) run only when the pass is
+            // single-worker (enforced by the caller's gate) and (b) restore
+            // the parameter it borrows.  Lpk_NodeCuts also writes network
+            // traversal marks, which is safe only in single-worker mode.
+            fSaturSaved = pS->pPars->fSatur;
             pS->pPars->fSatur = 0;
             pS->vTemp = Vec_PtrAlloc( 32 );
             Lpk_NodeCuts( pS );
+            pS->pPars->fSatur = fSaturSaved;
             nProbed++;
             if ( pS->nEvals != p->nEvals || pS->nCuts != p->nCuts )
             {
@@ -1003,6 +1106,29 @@ static void Lpk_ParRecFree( Lpk_ParRec_t * pRec )
     ABC_FREE( pRec );
 }
 
+/* Task 81 Q1 retention accounting.  Conservative upper bound of the bytes a
+   retained record pins, used to enforce a hard per-pass budget: the struct,
+   both id vectors at their allocated capacity, and the plan payload.  Plan
+   payloads are counted as an upper bound over the parameter ranges
+   (nFuns <= LPK_SIZE_MAX, one Lpk_Fun_t plus its truth tables and the
+   decomposition pointer/leaf vectors per Fun). */
+#define LPK_PAR_FUN_BYTES_MAX 1024
+
+static long Lpk_ParRecBytes( Lpk_ParRec_t * pRec )
+{
+    long nBytes = (long)sizeof(Lpk_ParRec_t)
+                + 4L * (pRec->vWin->nCap + pRec->vLeaves->nCap);
+    if ( pRec->fPlan )
+    {
+        if ( pRec->fLutMin )
+            nBytes += 4L * ((1L << pRec->nLeaves) + pRec->nLeaves);
+        else
+            nBytes += (long)pRec->nFuns * (LPK_PAR_FUN_BYTES_MAX + 8L)
+                    + 4L * pRec->nLeaves;
+    }
+    return nBytes;
+}
+
 ////////////////////////////////////////////////////////////////////////
 ///               worker context and thread pool                     ///
 ////////////////////////////////////////////////////////////////////////
@@ -1031,6 +1157,8 @@ static Lpk_ParCtx_t * Lpk_ParCtxStart( int iWorker, Lpk_ParPass_t * pPass )
     pC->Memo = ABC_ALLOC( Lpk_ParMemo_t, pC->nMemo );
     memset( pC->Memo, 0, sizeof(pC->Memo[0]) * pC->nMemo );
     pC->MemoEpoch = 1;
+    pC->nWorkers = pPass->nWorkers > 0 ? pPass->nWorkers : 1;
+    pC->RetainBudget = pPass->RetainBudgetPerWorker;
     return pC;
 }
 
@@ -1058,10 +1186,45 @@ static void Lpk_ParWorkerChunk( Lpk_ParPass_t * pPass, Lpk_ParCtx_t * pC, int iC
         iStop = pPass->nPivots;
     for ( i = iStart; i < iStop; i++ )
     {
+        Lpk_ParRec_t * pRec = NULL;
+        long nBytes;
         v = pPass->vPivots[i];
+        // Task 81 Q1: hard retention bound.  Once this worker's share of the
+        // pass budget is spent, the remaining pivots are deferred: the commit
+        // phase re-evaluates them serially on the live network, which is
+        // exactly what the serial sweep does at that point, so results are
+        // unchanged while retained memory stays bounded.
+        if ( pC->RetainedBytes >= pC->RetainBudget )
+        {
+            pPass->pDeferred[v] = 1;
+            pC->nDeferred++;
+            continue;
+        }
         pC->pMan->pObj = Abc_NtkObj( pPass->pNtk, v );
         assert( pC->pMan->pObj && Abc_ObjIsNode(pC->pMan->pObj) );
-        Lpk_ParEvalPivot( pC, pC->pMan, &pPass->ppRecs[v] );
+        Lpk_ParEvalPivot( pC, pC->pMan, &pRec );
+        if ( pRec == NULL )
+            continue;   // MFFC==1 pivot: nothing to retain or commit
+        nBytes = Lpk_ParRecBytes( pRec );
+        if ( pC->RetainedBytes + nBytes > pC->RetainBudget && pC->nRetainedRecs > 0 )
+        {
+            Lpk_ParRecFree( pRec );
+            pPass->pDeferred[v] = 1;
+            pC->nDeferred++;
+            continue;
+        }
+        pC->RetainedBytes += nBytes;
+        pC->nRetainedRecs++;
+        // Focused correctness fixture (default off): corrupt this record's
+        // fingerprint so the commit-time invalidation repair must reject the
+        // detached plan and fall back to the serial path.  Used to prove the
+        // repair triggers and that results stay correct.
+        if ( getenv("LUTPACK_SELFTEST_FP") && pPass->nSelftestFp == 0 )
+        {
+            pRec->uFp ^= 0x5a5a5a5a5a5a5a5aULL;
+            pPass->nSelftestFp++;
+        }
+        pPass->ppRecs[v] = pRec;
     }
 }
 
@@ -1101,6 +1264,7 @@ static void Lpk_ParAggregate( Lpk_ParPass_t * pPass, Lpk_ParCtx_t * pC )
     pPass->nDbgEvals += pC->nDbgEvals;
     pPass->nDbgGate += pC->nDbgGate;
     pPass->nDbgDec += pC->nDbgDec;
+    pPass->nDeferredPivots += pC->nDeferred;
 }
 
 /* run the parallel evaluation phase */
@@ -1199,6 +1363,12 @@ static int Lpk_ParDrifted( Lpk_ParPass_t * pPass, Lpk_ParRec_t * pRec, int vPivo
         return 1;
     pObj = Abc_NtkObj( pNtk, vPivot );
     if ( pObj == NULL || Abc_ObjRequiredLevel(pObj) != pRec->Required )
+        return 1;
+    // Task 81 Q1: re-read every recorded window/leaf node's current fanin
+    // structure.  This binds the detached plan's boundary and dependencies to
+    // the live graph (see Lpk_ParFingerprint) and rejects any in-place change
+    // or id recycling that existence/level checks alone would miss.
+    if ( pRec->uFp != Lpk_ParFingerprint( pNtk, pRec ) )
         return 1;
     // Task 80 F2 closure: even when every recorded id is alive, an earlier
     // serial commit can have attached NEW consumers to window-interior
@@ -1301,6 +1471,19 @@ static void Lpk_ParCommitPhase( Lpk_ParPass_t * pPass )
             Lpk_ResynthesizeNodeNew( p );
             continue;
         }
+        if ( pPass->pDeferred[v] )
+        {
+            // Task 81 Q1 retention bound: this pivot's evaluation was not
+            // retained.  Re-evaluate it with the serial machinery now, which
+            // is the serial sweep's own behaviour at this point.
+            int nChangesBef = p->nChanges;
+            p->pObj = pObj;
+            Lpk_ResynthesizeNodeNew( p );
+            pPass->nDeferredPivots++;
+            if ( p->nChanges != nChangesBef )
+                pPass->nCommittedSerial++;
+            continue;
+        }
         pRec = pPass->ppRecs[v];
         if ( pRec == NULL )
         {
@@ -1315,16 +1498,23 @@ static void Lpk_ParCommitPhase( Lpk_ParPass_t * pPass )
         {
             // evaluation context intact: the parallel plan is exactly what
             // the serial evaluation would have chosen at this point
+            int nChangesBef = p->nChanges;
             if ( pRec->fPlan )
                 Lpk_ParCommitPlan( pPass, pRec, v );
+            if ( p->nChanges != nChangesBef )
+                pPass->nCommittedNew++;
         }
         else
         {
             // context drifted: discard the plan and re-evaluate with the
             // serial machinery on the live network
+            int nChangesBef = p->nChanges;
             Lpk_ParRecFreePlan( pRec );
             p->pObj = pObj;
             Lpk_ResynthesizeNodeNew( p );
+            pPass->nDriftedPivots++;
+            if ( p->nChanges != nChangesBef )
+                pPass->nCommittedSerial++;
         }
     }
 }
@@ -1345,14 +1535,54 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
     Pass.p = p;
     Pass.pNtk = pNtk;
     Pass.nNodes = nNodes;
-    Pass.nWorkers = nWorkers;
     Pass.pOffered = ABC_ALLOC( char, nNodes );
     Pass.ppRecs = ABC_ALLOC( Lpk_ParRec_t *, nNodes );
+    Pass.pDeferred = ABC_ALLOC( char, nNodes );
     memset( Pass.pOffered, 0, sizeof(char) * nNodes );
     memset( Pass.ppRecs, 0, sizeof(Lpk_ParRec_t *) * nNodes );
+    memset( Pass.pDeferred, 0, sizeof(char) * nNodes );
     Pass.vPivots = NULL;
     Pass.nPivots = 0;
     Pass.NextChunk = 0;
+    // Task 81 Q1 storage admission, reported separately:
+    //  * global-id scratch: three int[] generation/count/union arrays per
+    //    worker, sized by Abc_NtkObjNumMax.  Its byte cost is computed here
+    //    and the worker count is reduced to fit LUTPACK_SCRATCH_MB so the
+    //    allocation is an explicit admission decision, not an unbounded one.
+    //  * bounded active-window storage: the per-pivot vectors, capped by
+    //    LUTPACK_RETAIN_MB through the deferral fallback above.
+    {
+        long nMarkSize = (long)Abc_NtkObjNumMax(pNtk) + 1;
+        long nScratchPerWorker = 3L * (long)sizeof(int) * nMarkSize;
+        long nScratchBudget = 2048L * 1024L * 1024L;
+        long nRetainBudget = 512L * 1024L * 1024L;
+        long nMaxWorkers;
+        if ( getenv("LUTPACK_SCRATCH_MB") )
+        {
+            long v = atol( getenv("LUTPACK_SCRATCH_MB") );
+            if ( v > 0 ) nScratchBudget = v * 1024L * 1024L;
+        }
+        if ( getenv("LUTPACK_RETAIN_MB") )
+        {
+            long v = atol( getenv("LUTPACK_RETAIN_MB") );
+            if ( v > 0 ) nRetainBudget = v * 1024L * 1024L;
+        }
+        nMaxWorkers = nScratchPerWorker > 0 ? nScratchBudget / nScratchPerWorker : nWorkers;
+        if ( nMaxWorkers < 1 ) nMaxWorkers = 1;
+        if ( (long)nWorkers > nMaxWorkers )
+        {
+            if ( getenv("LUTPACK_STATS") || getenv("LUTPACK_DEBUG") )
+                printf( "[lpkpar] storage admission: scratch %ld B/worker, budget %ld B -> workers %d reduced to %ld\n",
+                    nScratchPerWorker, nScratchBudget, nWorkers, nMaxWorkers );
+            nWorkers = (int)nMaxWorkers;
+        }
+        Pass.nWorkers = nWorkers;
+        Pass.ScratchBytes = nScratchPerWorker * (long)(nWorkers + 1);  // + driver context
+        Pass.WindowBytesMax = nRetainBudget;
+        Pass.PlanCapBytes = nRetainBudget;
+        Pass.RetainBudgetPerWorker = nRetainBudget / (nWorkers > 0 ? nWorkers : 1);
+        if ( Pass.RetainBudgetPerWorker < 1024 ) Pass.RetainBudgetPerWorker = 1024;
+    }
     // build the phase-A offered pivot list (serial filter at pass start)
     {
         int nCap = 0;
@@ -1374,6 +1604,7 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
         {
             ABC_FREE( Pass.pOffered );
             ABC_FREE( Pass.ppRecs );
+            ABC_FREE( Pass.pDeferred );
             return;
         }
         Pass.vPivots = ABC_ALLOC( int, nCap );
@@ -1415,6 +1646,23 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
         printf( "[lpkpar] pass pivots=%d enum=%d plan=%d committed=%d evals=%d gate_ok=%d dec_try=%d cuts_total=%d cuts_useful=%d\n",
             Pass.nPivots, nEnum, nPlan, nComm, Pass.nDbgEvals, Pass.nDbgGate, Pass.nDbgDec,
             p->nCutsTotal, p->nCutsUseful );
+        printf( "[lpkpar] commit committed_par=%d committed_serial=%d deferred=%d drifted=%d workers=%d\n",
+            Pass.nCommittedNew, Pass.nCommittedSerial, Pass.nDeferredPivots,
+            Pass.nDriftedPivots, Pass.nWorkers );
+    }
+    if ( getenv("LUTPACK_STATS") )
+    {
+        long nRetainedNow = 0;
+        for ( v = 0; v < nNodes; v++ )
+            if ( Pass.ppRecs[v] )
+                nRetainedNow += Lpk_ParRecBytes( Pass.ppRecs[v] );
+        printf( "[lpkpar] storage: nodes=%d workers=%d scratch_bytes=%ld retain_cap_bytes=%ld "
+                "retained_bytes_now=%ld deferred=%d drifted=%d "
+                "committed_par=%d committed_serial=%d\n",
+            nNodes, Pass.nWorkers, Pass.ScratchBytes,
+            Pass.RetainBudgetPerWorker * (long)Pass.nWorkers, nRetainedNow,
+            Pass.nDeferredPivots, Pass.nDriftedPivots,
+            Pass.nCommittedNew, Pass.nCommittedSerial );
     }
     // release records
     for ( v = 0; v < nNodes; v++ )
@@ -1425,6 +1673,7 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
         }
     ABC_FREE( Pass.ppRecs );
     ABC_FREE( Pass.pOffered );
+    ABC_FREE( Pass.pDeferred );
     ABC_FREE( Pass.vPivots );
     p->nPivots += Pass.nPivots;
     (void)i;
