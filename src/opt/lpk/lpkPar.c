@@ -79,13 +79,14 @@ typedef struct Lpk_ParRec_t_
     Vec_Int_t *  vWin;         // window interior ids read by enumeration
     Vec_Int_t *  vLeaves;      // (id, level) pairs of every enumerated leaf
     unsigned *   pTruth;       // lutmin plan: truth words
-    // Task 81 Q1: 64-bit structural fingerprint of every window/leaf node and
-    // its fanin edges, recomputed at commit time.  Together with the network's
-    // append-only id rule (abcObj.c: pObj->Id = vObjs->nSize, deleted slots are
-    // NULLed and never recycled) and node immutability under lutpack commit
-    // (nodes are created/deleted, never edited in place) this binds the
-    // detached plan's function, boundary and dependencies to the live graph.
-    ABC_UINT64_T uFp;
+    // Task 81 Q1 repair: exact live structure of every recorded window/leaf
+    // node, captured at evaluation time and compared field-by-field at commit
+    // time (see Lpk_ParLiveRecord / Lpk_ParLiveMatches).  Together with the
+    // network's append-only id rule (abcObj.c: pObj->Id = vObjs->nSize,
+    // deleted slots are NULLed and never recycled) and the live MFFC gate it
+    // binds the detached plan's boundary and dependencies to the live graph
+    // without relying on a hash.
+    Vec_Int_t *  vLive;
 } Lpk_ParRec_t;
 
 typedef struct Lpk_ParCtx_t_ Lpk_ParCtx_t;
@@ -165,46 +166,90 @@ static inline int Lpk_ParIsMember( Lpk_ParCtx_t * pC, int v )
     return pC->pCntGen[v] == pC->GenDrain && pC->pCnt[v] == 0;
 }
 
-/* ---- Task 81 Q1: live-context structural fingerprint -------------------
+/* ---- Task 81 Q1 repair: exact live-context record ----------------------
    The network's object ids are append-only: Abc_NtkObjAlloc assigns
    pObj->Id = pNtk->vObjs->nSize and pushes (abcObj.c:114-115); deletion
    writes NULL into the slot (abcObj.c:189,258) and never recycles it.  A
    live recorded id therefore still denotes the object that was evaluated,
-   and lutpack's commit path only creates and deletes nodes - it never edits
-   a live node's fanin edges.  The fingerprint re-reads every recorded
-   window/leaf node's *current* fanin edge structure; any in-place mutation
-   or id recycling would change it and force a serial re-evaluation. */
-static ABC_UINT64_T Lpk_ParFpMix( ABC_UINT64_T h, ABC_UINT64_T v )
-{
-    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-}
-
-static ABC_UINT64_T Lpk_ParFpAddNode( ABC_UINT64_T h, Abc_Ntk_t * pNtk, int v )
+   but a surviving node's fanin edges CAN change in place: the validated
+   commit path reaches Abc_NtkUpdate -> Abc_ObjReplace ->
+   Abc_ObjTransferFanout -> Abc_ObjPatchFanin (abcTiming.c:1423,
+   abcFanio.c:172,192,292,333), which rewrites the fanin slots of surviving
+   consumers.  The record therefore stores, for every recorded window/leaf
+   node, the exact live structure (fanin count, the local phase bits and
+   every fanin id) and the commit-time check compares it field by field.
+   Any in-place edit, id recycling or deletion is detected exactly - a hash
+   would only bound the collision probability and the previous version read
+   just fanins 0/1, missing a LUT4's third/fourth input.  Function-preserving
+   rewrites that patch an edge are still rejected here: the pivot then falls
+   back to the serial re-evaluation, which is always correct. */
+static void Lpk_ParLiveRecordNode( Abc_Ntk_t * pNtk, Vec_Int_t * vLive, int v )
 {
     Abc_Obj_t * pObj = Abc_NtkObj( pNtk, v );
-    int nFanin, f0 = -1, f1 = -1, c0 = 0, c1 = 0;
+    int i, nFanin;
     if ( pObj == NULL )
-        return Lpk_ParFpMix( h, 0xdeadbeefULL );
+    {
+        Vec_IntPush( vLive, -1 );
+        return;
+    }
     nFanin = Abc_ObjFaninNum( pObj );
-    if ( nFanin > 0 ) { f0 = Abc_ObjFaninId0(pObj); c0 = Abc_ObjFaninC0(pObj); }
-    if ( nFanin > 1 ) { f1 = Abc_ObjFaninId1(pObj); c1 = Abc_ObjFaninC1(pObj); }
-    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)v );
-    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)f0 );
-    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)f1 );
-    h = Lpk_ParFpMix( h, (ABC_UINT64_T)(unsigned)(nFanin * 4 + c0 * 2 + c1) );
-    return h;
+    Vec_IntPush( vLive, nFanin );
+    Vec_IntPush( vLive, (int)pObj->fCompl0 );
+    Vec_IntPush( vLive, (int)pObj->fCompl1 );
+    for ( i = 0; i < nFanin; i++ )
+        Vec_IntPush( vLive, Abc_ObjFaninId(pObj, i) );
 }
 
-static ABC_UINT64_T Lpk_ParFingerprint( Abc_Ntk_t * pNtk, Lpk_ParRec_t * pRec )
+static void Lpk_ParLiveRecord( Abc_Ntk_t * pNtk, Lpk_ParRec_t * pRec )
 {
-    ABC_UINT64_T h = 0x0123456789abcdefULL;
     int i, v;
+    Vec_IntClear( pRec->vLive );
     Vec_IntForEachEntry( pRec->vWin, v, i )
-        h = Lpk_ParFpAddNode( h, pNtk, v );
+        Lpk_ParLiveRecordNode( pNtk, pRec->vLive, v );
     for ( i = 0; i < Vec_IntSize(pRec->vLeaves); i += 2 )
-        h = Lpk_ParFpAddNode( h, pNtk, Vec_IntEntry(pRec->vLeaves, i) );
-    return h;
+        Lpk_ParLiveRecordNode( pNtk, pRec->vLive, Vec_IntEntry(pRec->vLeaves, i) );
+}
+
+/* exact field-by-field comparison of one node against its stored record */
+static int Lpk_ParLiveMatchNode( Abc_Ntk_t * pNtk, Vec_Int_t * vLive, int * pIdx, int v )
+{
+    Abc_Obj_t * pObj = Abc_NtkObj( pNtk, v );
+    int i, nFanin, nStored;
+    if ( *pIdx + 3 > Vec_IntSize(vLive) )
+        return 0;
+    nStored = Vec_IntEntry( vLive, (*pIdx)++ );
+    if ( pObj == NULL )
+        return nStored == -1;
+    if ( nStored == -1 )
+        return 0;
+    if ( nStored != Abc_ObjFaninNum(pObj) )
+        return 0;
+    if ( Vec_IntEntry( vLive, *pIdx ) != (int)pObj->fCompl0 )
+        return 0;
+    if ( Vec_IntEntry( vLive, *pIdx + 1 ) != (int)pObj->fCompl1 )
+        return 0;
+    *pIdx += 2;
+    if ( *pIdx + nStored > Vec_IntSize(vLive) )
+        return 0;
+    nFanin = nStored;
+    for ( i = 0; i < nFanin; i++ )
+        if ( Vec_IntEntry( vLive, (*pIdx)++ ) != Abc_ObjFaninId(pObj, i) )
+            return 0;
+    return 1;
+}
+
+static int Lpk_ParLiveMatches( Abc_Ntk_t * pNtk, Lpk_ParRec_t * pRec )
+{
+    int i, v, idx = 0;
+    if ( pRec->vLive == NULL )
+        return 0;
+    Vec_IntForEachEntry( pRec->vWin, v, i )
+        if ( !Lpk_ParLiveMatchNode( pNtk, pRec->vLive, &idx, v ) )
+            return 0;
+    for ( i = 0; i < Vec_IntSize(pRec->vLeaves); i += 2 )
+        if ( !Lpk_ParLiveMatchNode( pNtk, pRec->vLive, &idx, Vec_IntEntry(pRec->vLeaves, i) ) )
+            return 0;
+    return idx == Vec_IntSize(pRec->vLive);
 }
 
 static inline int Lpk_ParCutHasLeafInWindow( Lpk_Cut_t * pCut )
@@ -885,7 +930,7 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
     pRec->Required = Required;
     Vec_IntAppend( pRec->vWin, pC->vWinCur );
     Vec_IntAppend( pRec->vLeaves, pC->vLeafCur );
-    pRec->uFp = Lpk_ParFingerprint( p->pNtk, pRec );
+    Lpk_ParLiveRecord( p->pNtk, pRec );
     p->nCutsTotal += p->nCuts;
     p->nCutsUseful += p->nEvals;
     if ( getenv("LUTPACK_DEBUG3") && pC->nWorkers > 1 )
@@ -1073,6 +1118,7 @@ static Lpk_ParRec_t * Lpk_ParRecAlloc( void )
     memset( pRec, 0, sizeof(Lpk_ParRec_t) );
     pRec->vWin = Vec_IntAlloc( 64 );
     pRec->vLeaves = Vec_IntAlloc( 32 );
+    pRec->vLive = Vec_IntAlloc( 128 );
     return pRec;
 }
 
@@ -1103,6 +1149,7 @@ static void Lpk_ParRecFree( Lpk_ParRec_t * pRec )
     Lpk_ParRecFreePlan( pRec );
     Vec_IntFree( pRec->vWin );
     Vec_IntFree( pRec->vLeaves );
+    Vec_IntFree( pRec->vLive );
     ABC_FREE( pRec );
 }
 
@@ -1117,7 +1164,8 @@ static void Lpk_ParRecFree( Lpk_ParRec_t * pRec )
 static long Lpk_ParRecBytes( Lpk_ParRec_t * pRec )
 {
     long nBytes = (long)sizeof(Lpk_ParRec_t)
-                + 4L * (pRec->vWin->nCap + pRec->vLeaves->nCap);
+                + 4L * (pRec->vWin->nCap + pRec->vLeaves->nCap)
+                + 4L * (pRec->vLive ? pRec->vLive->nCap : 0);
     if ( pRec->fPlan )
     {
         if ( pRec->fLutMin )
@@ -1213,12 +1261,13 @@ static void Lpk_ParWorkerChunk( Lpk_ParPass_t * pPass, Lpk_ParCtx_t * pC, int iC
         pC->RetainedBytes += nBytes;
         pC->nRetainedRecs++;
         // Focused correctness fixture (default off): corrupt this record's
-        // fingerprint so the commit-time invalidation repair must reject the
-        // detached plan and fall back to the serial path.  Used to prove the
-        // repair triggers and that results stay correct.
+        // stored live structure so the commit-time invalidation repair must
+        // reject the detached plan and fall back to the serial path.  Used to
+        // prove the repair triggers and that results stay correct.
         if ( getenv("LUTPACK_SELFTEST_FP") && pPass->nSelftestFp == 0 )
         {
-            pRec->uFp ^= 0x5a5a5a5a5a5a5a5aULL;
+            if ( Vec_IntSize( pRec->vLive ) > 0 )
+                Vec_IntWriteEntry( pRec->vLive, 0, Vec_IntEntry( pRec->vLive, 0 ) ^ 1 );
             pPass->nSelftestFp++;
         }
         pPass->ppRecs[v] = pRec;
@@ -1361,11 +1410,13 @@ static int Lpk_ParDrifted( Lpk_ParPass_t * pPass, Lpk_ParRec_t * pRec, int vPivo
     pObj = Abc_NtkObj( pNtk, vPivot );
     if ( pObj == NULL || Abc_ObjRequiredLevel(pObj) != pRec->Required )
         return 1;
-    // Task 81 Q1: re-read every recorded window/leaf node's current fanin
-    // structure.  This binds the detached plan's boundary and dependencies to
-    // the live graph (see Lpk_ParFingerprint) and rejects any in-place change
-    // or id recycling that existence/level checks alone would miss.
-    if ( pRec->uFp != Lpk_ParFingerprint( pNtk, pRec ) )
+    // Task 81 Q1 repair: compare every recorded window/leaf node's exact live
+    // structure (fanin count, phase bits, every fanin id) against the record
+    // captured at evaluation time.  This binds the detached plan's boundary
+    // and dependencies to the live graph (see Lpk_ParLiveRecord) and rejects
+    // every in-place fanin edit - including fanins 2/3 of a LUT4, which the
+    // previous fanin-0/1 hash did not read - and every deleted/recycled id.
+    if ( !Lpk_ParLiveMatches( pNtk, pRec ) )
         return 1;
     // Task 80 F2 closure: even when every recorded id is alive, an earlier
     // serial commit can have attached NEW consumers to window-interior
@@ -1521,8 +1572,11 @@ static void Lpk_ParCommitPhase( Lpk_ParPass_t * pPass )
 ////////////////////////////////////////////////////////////////////////
 
 /* Main entry: one outer saturation pass with private-window parallel
-   evaluation.  Called from Lpk_Resynthesize when pPars->nWorkers > 1. */
-void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
+   evaluation.  Called from Lpk_Resynthesize when pPars->nWorkers > 1.
+   Returns 1 when the pass ran (including its single-worker fallback) and 0
+   when the scratch admission cannot fit the driver plus one worker context;
+   the caller then runs the classic serial iteration instead. */
+int Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
 {
     Abc_Ntk_t * pNtk = p->pNtk;
     Lpk_ParPass_t Pass;
@@ -1564,14 +1618,31 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
             long v = atol( getenv("LUTPACK_RETAIN_MB") );
             if ( v > 0 ) nRetainBudget = v * 1024L * 1024L;
         }
-        nMaxWorkers = nScratchPerWorker > 0 ? nScratchBudget / nScratchPerWorker : nWorkers;
-        if ( nMaxWorkers < 1 ) nMaxWorkers = 1;
+        // Driver plus worker scratch share the budget, so the admission bound
+        // counts every context: the driver's serial context plus one context
+        // per admitted worker.  Workers = budget/cost - 1 keeps
+        // ScratchBytes = cost * (workers + 1) <= budget a strict ceiling.  A
+        // budget that cannot hold the driver plus one worker is not a valid
+        // parallel admission; the pass then exits before evaluating anything
+        // and the caller's serial sweep re-evaluates every pivot unchanged.
+        nMaxWorkers = nScratchPerWorker > 0 ? nScratchBudget / nScratchPerWorker - 1 : nWorkers;
         if ( (long)nWorkers > nMaxWorkers )
         {
             if ( getenv("LUTPACK_STATS") || getenv("LUTPACK_DEBUG") )
-                printf( "[lpkpar] storage admission: scratch %ld B/worker, budget %ld B -> workers %d reduced to %ld\n",
+                printf( "[lpkpar] storage admission: scratch %ld B/context, budget %ld B -> workers %d reduced to %ld\n",
                     nScratchPerWorker, nScratchBudget, nWorkers, nMaxWorkers );
             nWorkers = (int)nMaxWorkers;
+        }
+        if ( nWorkers < 1 )
+        {
+            if ( getenv("LUTPACK_STATS") || getenv("LUTPACK_DEBUG") )
+                printf( "[lpkpar] storage admission: scratch %ld B/context, budget %ld B: "
+                        "no room for the driver plus one worker; parallel pass not admitted\n",
+                    nScratchPerWorker, nScratchBudget );
+            ABC_FREE( Pass.pOffered );
+            ABC_FREE( Pass.ppRecs );
+            ABC_FREE( Pass.pDeferred );
+            return 0;
         }
         Pass.nWorkers = nWorkers;
         Pass.ScratchBytes = nScratchPerWorker * (long)(nWorkers + 1);  // + driver context
@@ -1602,7 +1673,7 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
             ABC_FREE( Pass.pOffered );
             ABC_FREE( Pass.ppRecs );
             ABC_FREE( Pass.pDeferred );
-            return;
+            return 1;
         }
         Pass.vPivots = ABC_ALLOC( int, nCap );
         nPivots = 0;
@@ -1674,6 +1745,7 @@ void Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
     ABC_FREE( Pass.vPivots );
     p->nPivots += Pass.nPivots;
     (void)i;
+    return 1;
 }
 
 

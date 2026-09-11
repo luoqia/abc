@@ -666,10 +666,12 @@ int Lpk_Resynthesize( Abc_Ntk_t * pNtk, Lpk_Par_t * pPars )
         // consider all nodes
         nNodes = Abc_NtkObjNumMax(pNtk);
         if ( ( p->pPars->nWorkers > 1 || getenv("LUTPACK_FORCEPAR") ) && !pPars->fOldAlgo && !pPars->fVeryVerbose
-             && Abc_NtkNodeNum(pNtk) > 1000 )
+             && Abc_NtkNodeNum(pNtk) > 1000 && Lpk_PassPar( p, nNodes, p->pPars->nWorkers ) )
         {
             // private-window parallel evaluation + serial validated commits
-            Lpk_PassPar( p, nNodes, p->pPars->nWorkers );
+            // ran; Lpk_PassPar returns 0 when the scratch admission cannot fit
+            // the driver plus one worker context, and the serial loop below
+            // then performs this iteration unchanged.
         }
         else
         {

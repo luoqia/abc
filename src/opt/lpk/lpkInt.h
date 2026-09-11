@@ -234,7 +234,7 @@ extern int            Lpk_NodeCuts( Lpk_Man_t * p );
 extern Lpk_Man_t *    Lpk_ManStart( Lpk_Par_t * pPars );
 extern void           Lpk_ManStop( Lpk_Man_t * p );
 /*=== lpkPar.c ============================================================*/
-extern void           Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers );
+extern int            Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers );
 /*=== lpkMap.c =========================================================*/
 extern If_Obj_t *     Lpk_MapPrime( Lpk_Man_t * p, unsigned * pTruth, int nVars, If_Obj_t ** ppLeaves );
 extern If_Obj_t *     Lpk_MapTree_rec( Lpk_Man_t * p, Kit_DsdNtk_t * pNtk, If_Obj_t ** ppLeaves, int iLit, If_Obj_t * pResult );
