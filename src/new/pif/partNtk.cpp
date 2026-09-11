@@ -258,8 +258,9 @@ namespace pif
 		}
 
 		// === 推断 abc.rc 路径 ===
-		if (const char *env = getenv("PIF_ABC_RC"))
-			m_abcRc = env;
+		const char *rcEnv = getenv("PIF_ABC_RC");
+		if (rcEnv && *rcEnv)
+			m_abcRc = rcEnv;
 		else
 		{
 			// abc.rc 通常在可执行文件同目录或上级目录

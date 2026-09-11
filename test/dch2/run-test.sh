@@ -37,9 +37,9 @@ grep -qE "\-j <num>" help_dch2.log && ok "dch2 -h documents -j" || bad "dch2 -h 
 
 # ---- 2. invalid values ----------------------------------------------
 echo "== invalid values"
-for args in "-j 0" "-W 9" "-H -1" "-C -1"; do
+for args in "-j 0" "-j 17" "-j 2x" "-W 9" "-W 2147483648" "-H -1" "-H 999999999999999999999999" "-C -1" "-S seed"; do
   run_abc "inv_$(echo $args | tr ' ' '_')" "read $DIR/add8.blif; strash; dch2 $args"
-  if grep -qE "must be at least|cannot be negative|Invalid|usage: dch2" "inv_$(echo $args | tr ' ' '_').log"; then
+  if grep -qE "must be at least|must be between|cannot be negative|Invalid|usage: dch2" "inv_$(echo $args | tr ' ' '_').log"; then
     ok "dch2 $args rejected"
   else
     bad "dch2 $args rejected"
@@ -58,9 +58,9 @@ grep -q "DCH2: " opt_w10.log && ok "combined options run (-W -H -S -C -j)" || ba
 # ---- 4. j1/j4 identity and determinism --------------------------------
 echo "== j1/j4 identity + determinism"
 for fx in add8 dup4 chain32; do
-  run_abc "${fx}_j1"  "read $DIR/$fx.blif; strash; dch2 -j 1; write_blif ${fx}_j1.blif"
-  run_abc "${fx}_j4a" "read $DIR/$fx.blif; strash; dch2 -j 4; write_blif ${fx}_j4a.blif"
-  run_abc "${fx}_j4b" "read $DIR/$fx.blif; strash; dch2 -j 4; write_blif ${fx}_j4b.blif"
+  run_abc "${fx}_j1"  "read $DIR/$fx.blif; strash; dch2 -W 10 -H 4 -j 1; write_blif ${fx}_j1.blif"
+  run_abc "${fx}_j4a" "read $DIR/$fx.blif; strash; dch2 -W 10 -H 4 -j 4; write_blif ${fx}_j4a.blif"
+  run_abc "${fx}_j4b" "read $DIR/$fx.blif; strash; dch2 -W 10 -H 4 -j 4; write_blif ${fx}_j4b.blif"
   h1=$(ts_hash ${fx}_j1.blif) h4=$(ts_hash ${fx}_j4a.blif)
   [ "$h1" = "$h4" ] && ok "$fx j1/j4 output identity ($h1)" || bad "$fx j1/j4 output identity ($h1 vs $h4)"
   s1=$(grep -oE "DCH2: .*" ${fx}_j1.log | head -1 | sed 's/verify_ms=[0-9]* merge_ms=[0-9]*//')
@@ -154,6 +154,26 @@ run_abc defoff "read $DIR/dup4.blif; strash; dch2 -j 4 -v; write_blif defoff.bli
 grep -q "DCH2-TEST-INJECT" defoff.log && bad "no injection markers when env absent" || ok "no injection markers when env absent"
 hdef=$(ts_hash defoff.blif)
 [ "$hdef" = "$hbase" ] && ok "default-off output identical to baseline" || bad "default-off output identical to baseline"
+
+# Maximum valid integer options must not overflow window arithmetic or skip
+# the network. Small windows make the j4/j16 lanes actually run in parallel.
+case_id=0
+for args in "-W 2147483647" "-W 10 -H 2147483647" "-W 10 -H 4 -S 7" "-W 10 -H 0" "-W 10 -S -2147483648"; do
+  for workers in 1 4 16; do
+    tag="bounds_${case_id}_j${workers}"
+    run_abc "$tag" "read $DIR/chain32.blif; strash; dch2 $args -j $workers; write_blif $tag.blif"
+    if [ ! -s "$tag.blif" ]; then
+      bad "$args j$workers produced no output"
+      continue
+    fi
+    hash=$(ts_hash "$tag.blif")
+    if [ "$workers" = 1 ]; then base_hash=$hash; fi
+    [ "$hash" = "$base_hash" ] && ok "$args j$workers identity" || bad "$args j$workers identity"
+    run_abc "${tag}_cec" "read $DIR/chain32.blif; strash; cec $tag.blif"
+    grep -q 'Networks are equivalent' "${tag}_cec.log" && ok "$args j$workers CEC" || bad "$args j$workers CEC"
+  done
+  case_id=$((case_id + 1))
+done
 
 echo "DCH2-TEST done FAIL=$FAIL"
 exit $FAIL
