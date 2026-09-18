@@ -972,6 +972,7 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
                 {
                     // serial: the traversal marks currently set by Lpk_NodeCuts on pS
                     Abc_Obj_t * pX;
+                    void * pEntry;
                     int j2, nSer = 0, nPar = 0;
                     Vec_Ptr_t * vSer = Vec_PtrAlloc( 16 );
                     Vec_Ptr_t * vPar = Vec_PtrAlloc( 16 );
@@ -990,11 +991,11 @@ static void Lpk_ParEvalPivot( Lpk_ParCtx_t * pC, Lpk_Man_t * p, Lpk_ParRec_t ** 
                     }
                     printf( "[lpkpar] members serial=%d par=%d\n", nSer, nPar );
                     printf( "  serial: " );
-                    Vec_PtrForEachEntry( void *, vSer, pX, j2 )
-                        printf( "%d ", (int)(ABC_PTRUINT_T)pX );
+                    Vec_PtrForEachEntry( void *, vSer, pEntry, j2 )
+                        printf( "%d ", (int)(ABC_PTRUINT_T)pEntry );
                     printf( "\n  par:    " );
-                    Vec_PtrForEachEntry( void *, vPar, pX, j2 )
-                        printf( "%d ", (int)(ABC_PTRUINT_T)pX );
+                    Vec_PtrForEachEntry( void *, vPar, pEntry, j2 )
+                        printf( "%d ", (int)(ABC_PTRUINT_T)pEntry );
                     printf( "\n" );
                     Vec_PtrFree( vSer );
                     Vec_PtrFree( vPar );
