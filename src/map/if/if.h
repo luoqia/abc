@@ -361,6 +361,7 @@ struct If_Man_t_
     If_ParMeta_t *     pParMeta;      // Stage 1 parallel preflight metadata
     If_ParRuntime_t *  pParRuntime;   // parallel mapper runtime
     If_Stage0Timing_t  Stage0Time;        // reporting-only timing split
+    int                fParPrecheckAccepted; // parallel precheck completed and owns the mapping path
     // statistics
 //    abctime                timeTruth;
 };

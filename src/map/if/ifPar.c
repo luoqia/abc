@@ -110,6 +110,14 @@ typedef enum If_ParJobKind_t_
     IF_PAR_JOB_IMPROVE_AND
 } If_ParJobKind_t;
 
+typedef enum If_ParPolicy_t_
+{
+    IF_PAR_POLICY_DEFAULT = 0,
+    IF_PAR_POLICY_RELAX_RATIO,
+    IF_PAR_POLICY_ABSOLUTE_TARGET,
+    IF_PAR_POLICY_AREA_ONLY
+} If_ParPolicy_t;
+
 typedef struct If_ParMode2Metric_t_ If_ParMode2Metric_t;
 struct If_ParMode2Metric_t_
 {
@@ -175,6 +183,11 @@ struct If_ParRuntime_t_
     int              nWorking;
     int              iLevel;
     int              Mode;
+    If_ParPolicy_t   Policy;
+    int              RequestedRelaxRatio;
+    float            RequestedDelayTarget;
+    float            RelaxTarget;
+    int              fRelaxTargetSet;
     int              fPreprocess;
     int              fFirst;
     int              nRoundLevels;
@@ -258,6 +271,42 @@ static void If_ManParSetReason( char ** ppReason, char * pReason )
         *ppReason = pReason;
 }
 
+static char * If_ManParPolicyName( If_ParPolicy_t Policy )
+{
+    if ( Policy == IF_PAR_POLICY_DEFAULT )
+        return (char *)"default";
+    if ( Policy == IF_PAR_POLICY_RELAX_RATIO )
+        return (char *)"relax_ratio";
+    if ( Policy == IF_PAR_POLICY_ABSOLUTE_TARGET )
+        return (char *)"absolute_target";
+    if ( Policy == IF_PAR_POLICY_AREA_ONLY )
+        return (char *)"area_only";
+    return (char *)"invalid";
+}
+
+static int If_ManParClassifyPolicyEntry( If_Man_t * p, If_ParPolicy_t * pPolicy, char ** ppReason )
+{
+    If_Par_t * pPars = p->pPars;
+    int fRelax, fTarget, fArea;
+    if ( pPars->nRelaxRatio < 0 )
+        { If_ManParSetReason( ppReason, "invalid_relax_ratio" ); return 0; }
+    if ( !If_ParFloatEq( pPars->DelayTarget, (float)-1.0 ) &&
+         (!isfinite((double)pPars->DelayTarget) || pPars->DelayTarget <= 0.0) )
+        { If_ManParSetReason( ppReason, "invalid_delay_target" ); return 0; }
+    fRelax = pPars->nRelaxRatio > 0;
+    fTarget = !If_ParFloatEq( pPars->DelayTarget, (float)-1.0 );
+    fArea = pPars->fArea != 0;
+    if ( fRelax + fTarget + fArea > 1 )
+        { If_ManParSetReason( ppReason, "policy_combination" ); return 0; }
+    if ( pPars->fAreaOnly || !If_ParFloatEq(pPars->DelayTargetNew, (float)0.0) )
+        { If_ManParSetReason( ppReason, "preexisting_policy_state" ); return 0; }
+    *pPolicy = fRelax ? IF_PAR_POLICY_RELAX_RATIO :
+               (fTarget ? IF_PAR_POLICY_ABSOLUTE_TARGET :
+                (fArea ? IF_PAR_POLICY_AREA_ONLY : IF_PAR_POLICY_DEFAULT));
+    If_ManParSetReason( ppReason, "ok" );
+    return 1;
+}
+
 static int If_ManParCheckDefaultTiming( If_Man_t * p, char ** ppReason )
 {
     If_Obj_t * pObj;
@@ -288,6 +337,9 @@ static int If_ManParCheckDefaultTiming( If_Man_t * p, char ** ppReason )
 int If_ManParIsSupported( If_Man_t * p, char ** ppReason )
 {
     If_Par_t * pPars = p->pPars;
+    If_ParPolicy_t Policy;
+    if ( !If_ManParClassifyPolicyEntry( p, &Policy, ppReason ) )
+        return 0;
     if ( pPars->nParThreads < 1 )
         { If_ManParSetReason( ppReason, "invalid_thread_count" ); return 0; }
     if ( pPars->nParThreads > IF_PAR_THREAD_MAX )
@@ -308,18 +360,12 @@ int If_ManParIsSupported( If_Man_t * p, char ** ppReason )
         { If_ManParSetReason( ppReason, "nondefault_flow_iters" ); return 0; }
     if ( pPars->nAreaIters != 2 )
         { If_ManParSetReason( ppReason, "nondefault_area_iters" ); return 0; }
-    if ( !If_ParFloatEq( pPars->DelayTarget, (float)-1.0 ) )
-        { If_ManParSetReason( ppReason, "delay_target" ); return 0; }
     if ( !If_ParFloatEq( pPars->Epsilon, (float)0.005 ) )
         { If_ManParSetReason( ppReason, "epsilon" ); return 0; }
     if ( !If_ParFloatEq( pPars->WireDelay, (float)0.0 ) )
         { If_ManParSetReason( ppReason, "wire_delay" ); return 0; }
-    if ( pPars->nRelaxRatio != 0 )
-        { If_ManParSetReason( ppReason, "relax_ratio" ); return 0; }
     if ( pPars->fPreprocess != 1 )
         { If_ManParSetReason( ppReason, "disabled_preprocess" ); return 0; }
-    if ( pPars->fArea != 0 )
-        { If_ManParSetReason( ppReason, "area_only" ); return 0; }
     if ( pPars->fFancy != 0 )
         { If_ManParSetReason( ppReason, "fancy_mode" ); return 0; }
     if ( pPars->fEdge != 1 )
@@ -368,15 +414,14 @@ int If_ManParIsSupported( If_Man_t * p, char ** ppReason )
         { If_ManParSetReason( ppReason, "no_choice_expred_disabled" ); return 0; }
     if ( pPars->fExpRed != 0 && p->nChoices != 0 )
         { If_ManParSetReason( ppReason, "choice_expred_enabled" ); return 0; }
-    if ( pPars->fSkipCutFilter || pPars->fAreaOnly || pPars->fLiftLeaves || pPars->fUseCoAttrs )
+    if ( pPars->fSkipCutFilter || pPars->fLiftLeaves || pPars->fUseCoAttrs )
         { If_ManParSetReason( ppReason, "internal_mode" ); return 0; }
     if ( pPars->fUseBdds || pPars->fUseSops || pPars->fUseCnfs || pPars->fUseMv )
         { If_ManParSetReason( ppReason, "nonstandard_output" ); return 0; }
-    if ( !If_ParFloatEq( pPars->DelayTargetNew, (float)0.0 ) )
-        { If_ManParSetReason( ppReason, "delay_target_new" ); return 0; }
     if ( pPars->pReoMan )
         { If_ManParSetReason( ppReason, "reordering_manager" ); return 0; }
     If_ManParSetReason( ppReason, "supported" );
+    (void)Policy;
     return 1;
 }
 
@@ -458,6 +503,48 @@ static void If_ManParThreadSetError( If_ParThread_t * pThread, char * pError, If
     If_ManParRequestJobStop( pThread );
 }
 
+static int If_ManParCheckPolicyRuntime( If_Man_t * p, char ** ppReason )
+{
+    If_ParRuntime_t * pRuntime = p->pParRuntime;
+    If_Par_t * pPars = p->pPars;
+    if ( pRuntime == NULL )
+        { If_ManParSetReason( ppReason, "policy_runtime_missing" ); return 0; }
+    if ( pPars->nRelaxRatio != pRuntime->RequestedRelaxRatio ||
+         !If_ParFloatEq(pPars->DelayTarget, pRuntime->RequestedDelayTarget) )
+        { If_ManParSetReason( ppReason, "policy_request_changed" ); return 0; }
+    if ( pRuntime->Policy == IF_PAR_POLICY_DEFAULT )
+    {
+        if ( pRuntime->RequestedRelaxRatio != 0 || !If_ParFloatEq(pRuntime->RequestedDelayTarget, (float)-1.0) || pPars->fAreaOnly || !If_ParFloatEq(pPars->DelayTargetNew, (float)0.0) )
+            { If_ManParSetReason( ppReason, "policy_default_state" ); return 0; }
+    }
+    else if ( pRuntime->Policy == IF_PAR_POLICY_RELAX_RATIO )
+    {
+        if ( pRuntime->RequestedRelaxRatio <= 0 || !If_ParFloatEq(pRuntime->RequestedDelayTarget, (float)-1.0) || pPars->fAreaOnly )
+            { If_ManParSetReason( ppReason, "policy_relax_state" ); return 0; }
+        if ( !pRuntime->fRelaxTargetSet )
+        {
+            if ( !If_ParFloatEq(pPars->DelayTargetNew, (float)0.0) )
+                { If_ManParSetReason( ppReason, "policy_relax_target_early" ); return 0; }
+        }
+        else if ( !isfinite((double)pRuntime->RelaxTarget) || pRuntime->RelaxTarget <= 0.0 || !If_ParFloatEq(pPars->DelayTargetNew, pRuntime->RelaxTarget) )
+            { If_ManParSetReason( ppReason, "policy_relax_target_changed" ); return 0; }
+    }
+    else if ( pRuntime->Policy == IF_PAR_POLICY_ABSOLUTE_TARGET )
+    {
+        if ( pRuntime->RequestedRelaxRatio != 0 || pRuntime->RequestedDelayTarget <= 0.0 || pPars->fAreaOnly || !If_ParFloatEq(pPars->DelayTargetNew, (float)0.0) )
+            { If_ManParSetReason( ppReason, "policy_absolute_state" ); return 0; }
+    }
+    else if ( pRuntime->Policy == IF_PAR_POLICY_AREA_ONLY )
+    {
+        if ( pRuntime->RequestedRelaxRatio != 0 || !If_ParFloatEq(pRuntime->RequestedDelayTarget, (float)-1.0) || !pPars->fAreaOnly || !pPars->fArea || !If_ParFloatEq(pPars->DelayTargetNew, (float)0.0) )
+            { If_ManParSetReason( ppReason, "policy_area_state" ); return 0; }
+    }
+    else
+        { If_ManParSetReason( ppReason, "policy_invalid" ); return 0; }
+    If_ManParSetReason( ppReason, "ok" );
+    return 1;
+}
+
 static int If_ManParCheckMode0Standard( If_Man_t * p, char ** ppReason )
 {
     If_Par_t * pPars = p->pPars;
@@ -479,6 +566,8 @@ static int If_ManParCheckMode0Standard( If_Man_t * p, char ** ppReason )
         { If_ManParSetReason( ppReason, "mode0_nonstandard_flag" ); return 0; }
     if ( pPars->fLiftLeaves || pPars->fUseCoAttrs || p->vCuts != NULL )
         { If_ManParSetReason( ppReason, "mode0_nonstandard_flag" ); return 0; }
+    if ( !If_ManParCheckPolicyRuntime( p, ppReason ) )
+        return 0;
     If_ManParSetReason( ppReason, "ok" );
     return 1;
 }
@@ -2041,8 +2130,11 @@ static void If_ManParRuntimeStop( If_Man_t * p )
 static int If_ManParRuntimeStart( If_Man_t * p, char ** ppReason )
 {
     If_ParRuntime_t * pRuntime;
+    If_ParPolicy_t Policy;
     int i;
     assert( p->pParMeta != NULL );
+    if ( !If_ManParClassifyPolicyEntry( p, &Policy, ppReason ) )
+        return 0;
     if ( p->pPars->nParThreads < 1 || p->pPars->nParThreads > IF_PAR_THREAD_MAX )
         { If_ManParSetReason( ppReason, "runtime_thread_count" ); return 0; }
 #ifndef ABC_USE_PTHREADS
@@ -2055,6 +2147,11 @@ static int If_ManParRuntimeStart( If_Man_t * p, char ** ppReason )
         { If_ManParSetReason( ppReason, "runtime_alloc" ); return 0; }
     pRuntime->pMan = p;
     pRuntime->nThreads = p->pPars->nParThreads;
+    pRuntime->Policy = Policy;
+    pRuntime->RequestedRelaxRatio = p->pPars->nRelaxRatio;
+    pRuntime->RequestedDelayTarget = p->pPars->DelayTarget;
+    pRuntime->RelaxTarget = 0.0;
+    pRuntime->fRelaxTargetSet = 0;
     p->pParRuntime = pRuntime;
     If_ManParProfileInit( pRuntime );
     pRuntime->pThreads = ABC_CALLOC( If_ParThread_t, pRuntime->nThreads );
@@ -2530,10 +2627,12 @@ static int If_ManParMetaCheck( If_Man_t * p, char ** ppReason )
 static void If_ManParPrintMeta( If_Man_t * p )
 {
     If_ParMeta_t * pMeta = p->pParMeta;
-    if ( !p->pPars->fVerbose || pMeta == NULL )
+    If_ParRuntime_t * pRuntime = p->pParRuntime;
+    if ( !p->pPars->fVerbose || pMeta == NULL || pRuntime == NULL )
         return;
-    Abc_Print( 1, "IF_PAR_SUPPORTED levels=%d ands=%d choices=%d providers=%d max_free_level=%d cutsets=%d threads=%d\n",
-        pMeta->nLevels, pMeta->nAnds, pMeta->nChoices, pMeta->nProviders, pMeta->nMaxFreeLevel, pMeta->nCutSetPeak, p->pPars->nParThreads );
+    Abc_Print( 1, "IF_PAR_SUPPORTED levels=%d ands=%d choices=%d providers=%d max_free_level=%d cutsets=%d threads=%d policy=%s\n",
+        pMeta->nLevels, pMeta->nAnds, pMeta->nChoices, pMeta->nProviders, pMeta->nMaxFreeLevel, pMeta->nCutSetPeak,
+        p->pPars->nParThreads, If_ManParPolicyName(pRuntime->Policy) );
     Abc_Print( 1, "IF_PAR_SLOT_SUMMARY static_slot=1 slot_count=%d slot_assign_time=%.6f slot_validate_time=%.6f\n",
         pMeta->nCutSetPeak, If_ManStage0TimeSec(pMeta->SlotAssignTime), If_ManStage0TimeSec(pMeta->SlotValidateTime) );
 }
@@ -2542,6 +2641,7 @@ int If_ManParPrecheck( If_Man_t * p )
 {
     char * pReason = NULL;
     assert( p->pPars->fParMap );
+    p->fParPrecheckAccepted = 0;
     If_ManParFree( p );
     if ( !If_ManParIsSupported( p, &pReason ) )
     {
@@ -2565,6 +2665,7 @@ int If_ManParPrecheck( If_Man_t * p )
         If_ManParFree( p );
         return 0;
     }
+    p->fParPrecheckAccepted = 1;
     If_ManParPrintMeta( p );
     return 1;
 }
@@ -3351,11 +3452,12 @@ static int If_ManParMode1CheckRefs( If_Man_t * p )
 
 static int If_ManParCheckMode1Standard( If_Man_t * p, char ** ppReason )
 {
+    If_ParRuntime_t * pRuntime = p->pParRuntime;
     If_Obj_t * pObj, * pTemp;
     int i;
     if ( !If_ManParCheckMode0Standard( p, ppReason ) )
         return 0;
-    if ( p->pPars->fArea || p->pPars->fFancy )
+    if ( p->pPars->fFancy || (pRuntime->Policy == IF_PAR_POLICY_AREA_ONLY ? !p->pPars->fArea : p->pPars->fArea) )
         { If_ManParSetReason( ppReason, "mode1_nonstandard_flag" ); return 0; }
     If_ManForEachNode( p, pObj, i )
     {
@@ -3371,11 +3473,12 @@ static int If_ManParCheckMode1Standard( If_Man_t * p, char ** ppReason )
 
 static int If_ManParCheckMode2Standard( If_Man_t * p, char ** ppReason )
 {
+    If_ParRuntime_t * pRuntime = p->pParRuntime;
     If_Obj_t * pObj, * pTemp;
     int i;
     if ( !If_ManParCheckMode0Standard( p, ppReason ) )
         return 0;
-    if ( p->pPars->fArea || p->pPars->fFancy )
+    if ( p->pPars->fFancy || (pRuntime->Policy == IF_PAR_POLICY_AREA_ONLY ? !p->pPars->fArea : p->pPars->fArea) )
         { If_ManParSetReason( ppReason, "mode2_nonstandard_flag" ); return 0; }
     If_ManForEachNode( p, pObj, i )
     {
@@ -3710,18 +3813,29 @@ static int If_ManParRunImproveMapping( If_Man_t * p )
 
 int If_ManParImproveMapping( If_Man_t * p, int * pfHandled )
 {
-    char * pReason = NULL;
     if ( pfHandled )
         *pfHandled = 0;
     if ( !p->pPars->fParMap )
         return 1;
-    if ( !If_ManParIsSupported( p, &pReason ) )
+    if ( !p->fParPrecheckAccepted )
+    {
+        if ( p->pParRuntime != NULL || p->pParMeta != NULL )
+        {
+            Abc_Print( -1, "IF_PAR_INVARIANT reason=improve_runtime_unaccepted\n" );
+            return 0;
+        }
         return 1;
+    }
     if ( pfHandled )
         *pfHandled = 1;
-    if ( p->pParRuntime == NULL || p->pParMeta == NULL )
+    if ( p->pParRuntime == NULL && p->pParMeta == NULL )
     {
         Abc_Print( -1, "IF_PAR_INVARIANT reason=improve_runtime_missing\n" );
+        return 0;
+    }
+    if ( p->pParRuntime == NULL || p->pParMeta == NULL )
+    {
+        Abc_Print( -1, "IF_PAR_INVARIANT reason=improve_runtime_partial\n" );
         return 0;
     }
     return If_ManParRunImproveMapping( p );
@@ -3736,8 +3850,6 @@ static int If_ManParCheckRequiredStandard( If_Man_t * p, char ** ppReason )
         return 0;
     if ( !If_ManParCheckMode0Standard( p, ppReason ) )
         return 0;
-    if ( pPars->fAreaOnly )
-        { If_ManParSetReason( ppReason, "area_only" ); return 0; }
     if ( pPars->fDoAverage )
         { If_ManParSetReason( ppReason, "average_required" ); return 0; }
     if ( pPars->fLatchPaths || pPars->nLatchesCi || pPars->nLatchesCo || pPars->nLatchesCiBox || pPars->nLatchesCoBox )
@@ -3876,6 +3988,8 @@ static int If_ManParRequiredFlatScanObj( If_ParThread_t * pThread, int ObjId )
     if ( pObj == NULL )
         { If_ManParThreadSetError( pThread, "required_flat_obj_null", NULL ); return 0; }
     pObj->nVisits = pObj->nVisitsCopy;
+    if ( pRuntime->Policy == IF_PAR_POLICY_AREA_ONLY )
+        pObj->Required = IF_FLOAT_LARGE;
     if ( !If_ObjIsAnd(pObj) || pObj->nRefs == 0 )
         return 1;
     pCut = If_ObjCutBest(pObj);
@@ -3912,16 +4026,70 @@ static int If_ManParRequiredFlatSanitizeStats( If_Man_t * p )
     return 1;
 }
 
-static int If_ManParRequiredInitDefaultStage9( If_Man_t * p )
+static int If_ManParRequiredInitPolicy( If_Man_t * p, If_ParRequiredSource_t Source, int Mode, int * pfPropagate )
 {
+    If_ParRuntime_t * pRuntime = p->pParRuntime;
+    If_Par_t * pPars = p->pPars;
     If_Obj_t * pObj;
+    float ActualDelay;
     int i;
-    p->RequiredGlo = If_ManDelayMax( p, 0 );
-    if ( !If_ManParRequiredFloatValid( p->RequiredGlo ) )
+    *pfPropagate = 1;
+    ActualDelay = If_ManDelayMax( p, 0 );
+    p->RequiredGlo = ActualDelay;
+    if ( !If_ManParRequiredFloatValid( ActualDelay ) )
     {
         Abc_Print( -1, "IF_PAR_INVARIANT reason=required_global_float\n" );
         return 0;
     }
+    if ( pRuntime->Policy == IF_PAR_POLICY_RELAX_RATIO )
+    {
+        if ( !pRuntime->fRelaxTargetSet )
+        {
+            pRuntime->RelaxTarget = (float)(ActualDelay * (100.0 + pRuntime->RequestedRelaxRatio) / 100.0);
+            if ( !If_ManParRequiredFloatValid(pRuntime->RelaxTarget) || pRuntime->RelaxTarget <= 0.0 )
+            {
+                Abc_Print( -1, "IF_PAR_INVARIANT reason=required_relax_target_float\n" );
+                return 0;
+            }
+            pRuntime->fRelaxTargetSet = 1;
+            pPars->DelayTargetNew = pRuntime->RelaxTarget;
+        }
+        if ( !If_ParFloatEq(pPars->DelayTargetNew, pRuntime->RelaxTarget) )
+        {
+            Abc_Print( -1, "IF_PAR_INVARIANT reason=required_relax_target_changed\n" );
+            return 0;
+        }
+        p->RequiredGlo = pRuntime->RelaxTarget;
+    }
+    else if ( pRuntime->Policy == IF_PAR_POLICY_ABSOLUTE_TARGET )
+    {
+        if ( ActualDelay > pRuntime->RequestedDelayTarget + p->fEpsilon )
+        {
+            if ( p->fNextRound == 0 )
+            {
+                p->fNextRound = 1;
+                Abc_Print( 0, "Cannot meet the target required times (%4.2f). Mapping continues anyway.\n", pRuntime->RequestedDelayTarget );
+            }
+        }
+        else if ( ActualDelay < pRuntime->RequestedDelayTarget - p->fEpsilon )
+        {
+            if ( p->fNextRound == 0 )
+                p->fNextRound = 1;
+            p->RequiredGlo = pRuntime->RequestedDelayTarget;
+        }
+    }
+    else if ( pRuntime->Policy == IF_PAR_POLICY_AREA_ONLY )
+        *pfPropagate = 0;
+    else if ( pRuntime->Policy != IF_PAR_POLICY_DEFAULT )
+    {
+        Abc_Print( -1, "IF_PAR_INVARIANT reason=required_policy_invalid\n" );
+        return 0;
+    }
+    if ( p->pPars->fVerbose )
+        Abc_Print( 1, "IF_PAR_REQUIRED_POLICY source=%s mode=%d policy=%s actual_delay=%.6f required_glo=%.6f propagate=%d\n",
+            If_ManParRequiredSourceName(Source), Mode, If_ManParPolicyName(pRuntime->Policy), ActualDelay, p->RequiredGlo, *pfPropagate );
+    if ( !*pfPropagate )
+        return 1;
     if ( !If_ManParRequiredKeysInit( p ) )
     {
         Abc_Print( -1, "IF_PAR_INVARIANT reason=required_key_init\n" );
@@ -3931,6 +4099,22 @@ static int If_ManParRequiredInitDefaultStage9( If_Man_t * p )
         if ( !If_ManParRequiredAtomicMinObj( p->pParRuntime, If_ObjFanin0(pObj), p->RequiredGlo ) )
         {
             Abc_Print( -1, "IF_PAR_INVARIANT reason=required_co_init obj=%d\n", If_ObjFanin0(pObj)->Id );
+            return 0;
+        }
+    return 1;
+}
+
+static int If_ManParCheckAreaOnlyRequired( If_Man_t * p, If_ParRequiredSource_t Source )
+{
+    If_Obj_t * pObj;
+    int i, fValidate;
+    fValidate = Source == IF_PAR_REQUIRED_SOURCE_ROUND ? If_ManParRoundValidationEnabled() : If_ManParImproveValidationEnabled();
+    if ( !fValidate )
+        return 1;
+    If_ManForEachObj( p, pObj, i )
+        if ( pObj->Required != IF_FLOAT_LARGE )
+        {
+            Abc_Print( -1, "IF_PAR_INVARIANT reason=area_required_finite obj=%d required=%f\n", pObj->Id, pObj->Required );
             return 0;
         }
     return 1;
@@ -3953,9 +4137,9 @@ static int If_ManParRunRequiredStage9LevelJob( If_ParRuntime_t * pRuntime, int L
     return If_ManParRunRequiredStaticRangeJob( pRuntime, Level, IF_PAR_JOB_REQUIRED_STAGE9_AND, pJobObjs, nTasks, IF_PAR_REQUIRED_MIN_TASKS_PER_THREAD );
 }
 
-static int If_ManParComputeRequiredStage9Fast( If_Man_t * p, int Mode, int fMode0Rebuild )
+static int If_ManParComputeRequiredStage9Fast( If_Man_t * p, If_ParRequiredSource_t Source, int Mode, int fMode0Rebuild )
 {
-    int Level;
+    int Level, fPropagate;
     abctime clk, Elapsed;
     p->pParRuntime->Mode = Mode;
     clk = Abc_Clock();
@@ -3971,9 +4155,11 @@ static int If_ManParComputeRequiredStage9Fast( If_Man_t * p, int Mode, int fMode
         p->Stage0Time.required_rebuild_flat_time += Elapsed;
 
     clk = Abc_Clock();
-    if ( !If_ManParRequiredInitDefaultStage9( p ) )
+    if ( !If_ManParRequiredInitPolicy( p, Source, Mode, &fPropagate ) )
         return 0;
     p->Stage0Time.required_init_time += Abc_Clock() - clk;
+    if ( !fPropagate )
+        return If_ManParCheckAreaOnlyRequired( p, Source );
 
     clk = Abc_Clock();
     for ( Level = p->pParMeta->nLevels - 1; Level >= 0; Level-- )
@@ -4209,32 +4395,47 @@ int If_ManParComputeRequiredStage9( If_Man_t * p, If_ParRequiredSource_t Source,
     }
     if ( pfHandled )
         *pfHandled = 1;
-    return If_ManParComputeRequiredStage9Fast( p, Mode, fMode0Rebuild );
+    return If_ManParComputeRequiredStage9Fast( p, Source, Mode, fMode0Rebuild );
 }
 
 int If_ManParRunMappingRound( If_Man_t * p, int Mode, int fPreprocess, int fFirst, char * pLabel, int * pfHandled )
 {
     if ( pfHandled )
         *pfHandled = 0;
-    if ( p->pParRuntime == NULL || p->pParMeta == NULL )
+    if ( !p->pPars->fParMap )
         return 1;
+    if ( !p->fParPrecheckAccepted )
+    {
+        if ( p->pParRuntime != NULL || p->pParMeta != NULL )
+        {
+            Abc_Print( -1, "IF_PAR_INVARIANT reason=round_runtime_unaccepted\n" );
+            return 0;
+        }
+        return 1;
+    }
+    if ( pfHandled )
+        *pfHandled = 1;
+    if ( p->pParRuntime == NULL && p->pParMeta == NULL )
+    {
+        Abc_Print( -1, "IF_PAR_INVARIANT reason=round_runtime_missing\n" );
+        return 0;
+    }
+    if ( p->pParRuntime == NULL || p->pParMeta == NULL )
+    {
+        Abc_Print( -1, "IF_PAR_INVARIANT reason=round_runtime_partial\n" );
+        return 0;
+    }
     assert( p->pPars->fParMap );
     if ( Mode == 0 )
     {
-        if ( pfHandled )
-            *pfHandled = 1;
         return If_ManParRunMode0Round( p, fPreprocess, fFirst, pLabel );
     }
     if ( Mode == 1 )
     {
-        if ( pfHandled )
-            *pfHandled = 1;
         return If_ManParRunMode1Round( p, fPreprocess, fFirst, pLabel );
     }
     if ( Mode == 2 )
     {
-        if ( pfHandled )
-            *pfHandled = 1;
         return If_ManParRunMode2Round( p, fPreprocess, fFirst, pLabel );
     }
     return If_ManParRunRoundSkeleton( p, Mode, fPreprocess, fFirst, pLabel );
