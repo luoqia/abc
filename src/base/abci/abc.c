@@ -41297,7 +41297,7 @@ int Abc_CommandAbc9Synch2( Abc_Frame_t * pAbc, int argc, char ** argv )
     Dch_ManSetDefaultParams( pPars );
     pPars->nBTLimit = 100;
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "WCSKRfrvh" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "WCSKRfrtvh" ) ) != EOF )
     {
         switch ( c )
         {
@@ -41362,6 +41362,9 @@ int Abc_CommandAbc9Synch2( Abc_Frame_t * pAbc, int argc, char ** argv )
         case 'r':
             pPars->fSkipRedSupp ^= 1;
             break;
+        case 't':
+            pPars->fSimulateTfo ^= 1;
+            break;
         case 'v':
             pPars->fVerbose ^= 1;
             break;
@@ -41381,7 +41384,7 @@ int Abc_CommandAbc9Synch2( Abc_Frame_t * pAbc, int argc, char ** argv )
     return 0;
 
 usage:
-    Abc_Print( -2, "usage: &synch2 [-WCSKR num] [-frvh]\n" );
+    Abc_Print( -2, "usage: &synch2 [-WCSKR num] [-frtvh]\n" );
     Abc_Print( -2, "\t         computes structural choices using a new approach\n" );
     Abc_Print( -2, "\t-W num : the max number of simulation words [default = %d]\n", pPars->nWords );
     Abc_Print( -2, "\t-C num : the max number of conflicts at a node [default = %d]\n", pPars->nBTLimit );
@@ -41390,6 +41393,7 @@ usage:
     Abc_Print( -2, "\t-R num : the delay relaxation ratio (num >= 0) [default = %d]\n",   nRelaxRatio );
     Abc_Print( -2, "\t-f     : toggle using lighter logic synthesis [default = %s]\n", pPars->fLightSynth? "yes": "no" );
     Abc_Print( -2, "\t-r     : toggle skipping choices with redundant support [default = %s]\n", pPars->fSkipRedSupp? "yes": "no" );
+    Abc_Print( -2, "\t-t     : toggle simulation of the TFO classes after a counter-example [default = %s]\n", pPars->fSimulateTfo? "yes": "no" );
     Abc_Print( -2, "\t-v     : toggle verbose printout [default = %s]\n", pPars->fVerbose? "yes": "no" );
     Abc_Print( -2, "\t-h     : print the command usage\n");
     return 1;
