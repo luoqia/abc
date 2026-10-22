@@ -66,23 +66,36 @@ typedef std::shared_ptr<Decompose>   pDec;
 //===----------------------------------------------------------------------===//
 class Para {
 public:
-  Para(int k, int g, bool area, bool v) : lut_size_(k), gate_size_(g), area_oriented_(area), verbose_(v) {}
+  Para(int k, int g, bool area, bool v, bool rec = false, int rec_sweeps = 8,
+       long long rec_max_evals = 0)
+    : lut_size_(k), gate_size_(g), area_oriented_(area), verbose_(v),
+      exact_recover_(rec), recover_sweeps_(rec_sweeps),
+      recover_max_evals_(rec_max_evals) {}
 	Para& operator=(const Para& rhs) {
 		lut_size_ = rhs.lut_size_;
 		gate_size_ = rhs.gate_size_;
 		area_oriented_ = rhs.area_oriented_;
 		verbose_ = rhs.verbose_;
+		exact_recover_ = rhs.exact_recover_;
+		recover_sweeps_ = rhs.recover_sweeps_;
+		recover_max_evals_ = rhs.recover_max_evals_;
 		return *this;
-	}	
+	}
 	int getLutSize() const {return lut_size_;}
 	int getGateSize() const {return gate_size_;}
 	bool isAreaOriented() const {return area_oriented_;}
 	bool verbose() const {return verbose_;}
+	bool exactRecover() const {return exact_recover_;}
+	int  recoverSweeps() const {return recover_sweeps_;}
+	long long recoverMaxEvals() const {return recover_max_evals_;}
 private:
   int  lut_size_;
   int  gate_size_;
   bool area_oriented_;
   bool verbose_;
+  bool exact_recover_;
+  int  recover_sweeps_;
+  long long recover_max_evals_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -383,6 +396,11 @@ public:
   ~Mapper();
 public:
   int map();
+
+  // Exact live-cover recovery on the frozen cut pool: transactional
+  // single-root replacements scored by reference/dereference of the
+  // current live cover, validated by an independent full recount.
+  bool exactCoverRecover(Solution *sol);
 
   Abc_Ntk_t   *getNtk()     const { return pNtk_;                      }
   std::string  getNtkName() const { return std::string(pNtk_->pName);  }

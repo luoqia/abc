@@ -19,6 +19,10 @@
 ***********************************************************************/
 
 #include "agdmap.h"
+#include <algorithm>
+#include <climits>
+#include <functional>
+#include <vector>
 
 namespace AgdMap
 {
@@ -744,6 +748,9 @@ static int node_counter = 0;
 
     best_sol_ = lut_sol;
 
+    if (para_.exactRecover() && isAreaOriented())
+      exactCoverRecover(best_sol_);
+
     auto elapse_sel_end = std::chrono::high_resolution_clock::now();
 
     auto elapse_end = std::chrono::high_resolution_clock::now();
@@ -960,6 +967,333 @@ static int node_counter = 0;
         break;
       }
     } // end while
+  }
+
+  static int exactCutCost(const pCut &cut)
+  {
+    if (cut == nullptr)
+      return 0;
+    switch (cut->getType())
+    {
+    case Cut::General: return 1;
+    case Cut::Cut7:    return 2;
+    case Cut::Cut8:    return 4;
+    case Cut::Cut9:    return 8;
+    }
+    return 1;
+  }
+
+  bool Mapper::exactCoverRecover(Solution *sol)
+  {
+    if (sol == nullptr)
+      return false;
+
+    const int old_area = sol->lut_;
+    const std::map<Node *, pCut> old_sol = sol->sol_;
+    const std::map<Node *, int> old_weight = sol->weight_;
+    int area = old_area;
+    long long evaluations = 0;
+    long long pruned = 0;
+    long long commits = 0;
+    int sweeps = 0;
+    bool budget_limited = false;
+    const long long max_evals = para_.recoverMaxEvals();
+
+    auto restore_cover = [&]() {
+      sol->sol_ = old_sol;
+      sol->weight_ = old_weight;
+      sol->lut_ = old_area;
+    };
+
+    std::function<void(Node *)> detach = [&](Node *node) {
+      if (node == nullptr || !node->isAnd())
+        return;
+      auto wit = sol->weight_.find(node);
+      if (wit == sol->weight_.end() || wit->second <= 0)
+        return;
+      if (--wit->second > 0)
+        return;
+      auto sit = sol->sol_.find(node);
+      if (sit == sol->sol_.end() || sit->second == nullptr)
+        return;
+      pCut cut = sit->second;
+      area -= exactCutCost(cut);
+      for (Node *u : cut->inputs())
+        detach(u);
+    };
+
+    std::function<void(Node *)> attach = [&](Node *node) {
+      if (node == nullptr || !node->isAnd())
+        return;
+      int &w = sol->weight_[node];
+      if (++w > 1)
+        return;
+      pCut cut;
+      auto sit = sol->sol_.find(node);
+      if (sit != sol->sol_.end() && sit->second != nullptr)
+        cut = sit->second;
+      else
+      {
+        if (node->cutListNum() == 0)
+          return;
+        cut = node->minArea();
+        if (cut == nullptr)
+          return;
+        sol->sol_[node] = cut;
+      }
+      area += exactCutCost(cut);
+      for (Node *u : cut->inputs())
+        attach(u);
+    };
+
+    std::function<bool(int &)> recount = [&](int &out) {
+      std::set<Node *> seen;
+      std::vector<Node *> stack;
+      for (Node *po : Po_)
+      {
+        Node *fanin = po->fanin(0);
+        if (fanin != nullptr && fanin->isAnd())
+          stack.push_back(fanin);
+      }
+      out = 0;
+      while (!stack.empty())
+      {
+        Node *node = stack.back();
+        stack.pop_back();
+        if (!seen.insert(node).second)
+          continue;
+        auto wit = sol->weight_.find(node);
+        if (wit == sol->weight_.end() || wit->second <= 0)
+          return false;
+        auto sit = sol->sol_.find(node);
+        if (sit == sol->sol_.end() || sit->second == nullptr)
+          return false;
+        pCut cut = sit->second;
+        out += exactCutCost(cut);
+        for (Node *u : cut->inputs())
+          if (u != nullptr && u->isAnd())
+            stack.push_back(u);
+      }
+      return true;
+    };
+
+    auto replace_at = [&](Node *node, const pCut &from, const pCut &to) {
+      for (Node *u : from->inputs())
+        detach(u);
+      area += exactCutCost(to) - exactCutCost(from);
+      sol->sol_[node] = to;
+      for (Node *u : to->inputs())
+        attach(u);
+    };
+
+    int check_area = 0;
+    if (!recount(check_area) || check_area != area)
+    {
+      std::cout << "AGD exact recovery: initial recount mismatch (" << check_area
+                << " vs " << area << "), skipped\n";
+      return false;
+    }
+
+    // Candidate evaluation must not mutate the live cover. A generation-stamped
+    // scratch weight table simulates the exact detach/attach cascade, so the
+    // chosen cut and the commit order are identical to the transactional
+    // implementation while avoiding std::map writes per candidate.
+    int max_node_id = 0;
+    for (Node *node : nodes_)
+      max_node_id = std::max(max_node_id, node->getId());
+    std::vector<int> scratch_weight(max_node_id + 1, 0);
+    std::vector<int> scratch_stamp(max_node_id + 1, 0);
+    int scratch_generation = 0;
+    auto base_weight = [&](Node *node) {
+      auto it = sol->weight_.find(node);
+      return it == sol->weight_.end() ? 0 : it->second;
+    };
+    auto scratch_weight_of = [&](Node *node) {
+      int id = node->getId();
+      return scratch_stamp[id] == scratch_generation ? scratch_weight[id]
+                                                     : base_weight(node);
+    };
+    auto scratch_set_weight = [&](Node *node, int value) {
+      int id = node->getId();
+      scratch_stamp[id] = scratch_generation;
+      scratch_weight[id] = value;
+    };
+    auto sim_detach = [&](auto &&self, Node *node, int &delta) -> void {
+      if (node == nullptr || !node->isAnd())
+        return;
+      int w = scratch_weight_of(node);
+      if (w <= 0)
+        return;
+      scratch_set_weight(node, w - 1);
+      if (w - 1 > 0)
+        return;
+      auto sit = sol->sol_.find(node);
+      if (sit == sol->sol_.end() || sit->second == nullptr)
+        return;
+      pCut cut = sit->second;
+      delta -= exactCutCost(cut);
+      for (Node *u : cut->inputs())
+        self(self, u, delta);
+    };
+    auto sim_attach = [&](auto &&self, Node *node, int &delta) -> void {
+      if (node == nullptr || !node->isAnd())
+        return;
+      int w = scratch_weight_of(node);
+      scratch_set_weight(node, w + 1);
+      if (w + 1 > 1)
+        return;
+      pCut cut;
+      auto sit = sol->sol_.find(node);
+      if (sit != sol->sol_.end() && sit->second != nullptr)
+        cut = sit->second;
+      else
+      {
+        if (node->cutListNum() == 0)
+          return;
+        cut = node->minArea();
+        if (cut == nullptr)
+          return;
+      }
+      delta += exactCutCost(cut);
+      for (Node *u : cut->inputs())
+        self(self, u, delta);
+    };
+    auto inputs_cover = [](const pCut &sup, const pCut &sub) {
+      const auto &inputs = sup->inputs();
+      for (Node *u : sub->inputs())
+        if (std::find(inputs.begin(), inputs.end(), u) == inputs.end())
+          return false;
+      return true;
+    };
+
+    const int max_sweeps = std::max(1, para_.recoverSweeps());
+    for (sweeps = 0; sweeps < max_sweeps; ++sweeps)
+    {
+      bool changed = false;
+      for (Node *node : nodes_)
+      {
+        if (!node->isAnd())
+          continue;
+        auto wit = sol->weight_.find(node);
+        if (wit == sol->weight_.end() || wit->second <= 0)
+          continue;
+        auto sit = sol->sol_.find(node);
+        if (sit == sol->sol_.end() || sit->second == nullptr)
+          continue;
+        if (node->cutListNum() == 0)
+          continue;
+        pCut cur = sit->second;
+        const int base = area;
+        const int cur_cost = exactCutCost(cur);
+        pCut best = nullptr;
+        int best_area = base;
+        for (int i = 0; i < node->cutListNum(); ++i)
+        {
+          // The last enumerated cut is the trivial self cut; selecting it
+          // would create a self-dependent root and break liveness.
+          if (i == node->cutListNum() - 1)
+            continue;
+          pCut cand = node->getCut(i);
+          if (cand == nullptr || cand == cur)
+            continue;
+          const int cand_cost = exactCutCost(cand);
+          // If the candidate's inputs are a superset of the current cut's
+          // inputs, no subtree can be freed and no local cost is saved. It
+          // cannot improve the live area; skip the cascade simulation.
+          if (cand_cost >= cur_cost && inputs_cover(cand, cur))
+          {
+            ++pruned;
+            continue;
+          }
+          if (scratch_generation == INT_MAX)
+          {
+            std::fill(scratch_stamp.begin(), scratch_stamp.end(), 0);
+            scratch_generation = 0;
+          }
+          ++scratch_generation;
+          int delta = cand_cost - cur_cost;
+          for (Node *u : cur->inputs())
+            sim_detach(sim_detach, u, delta);
+          for (Node *u : cand->inputs())
+            sim_attach(sim_attach, u, delta);
+          ++evaluations;
+          const int candidate_area = base + delta;
+          if (candidate_area < best_area)
+          {
+            best_area = candidate_area;
+            best = cand;
+          }
+          if (max_evals > 0 && evaluations >= max_evals)
+          {
+            budget_limited = true;
+            break;
+          }
+        }
+        if (best != nullptr)
+        {
+          replace_at(node, cur, best);
+          if (area != best_area)
+          {
+            std::cout << "AGD exact recovery: commit drift at node "
+                      << node->getId() << ", recovery rolled back\n";
+            restore_cover();
+            return false;
+          }
+          ++commits;
+          changed = true;
+        }
+        if (budget_limited)
+          break;
+      }
+      if (budget_limited)
+        break;
+      if (!changed)
+        break;
+    }
+
+    int final_check = 0;
+    if (!recount(final_check) || final_check != area)
+    {
+      std::cout << "AGD exact recovery: final recount mismatch (" << final_check
+                << " vs " << area << "), recovery rolled back\n";
+      restore_cover();
+      return false;
+    }
+
+    sol->lut_ = area;
+    sol->lut_num_.assign(sol->lut_num_.size(), 0);
+    for (Node *node : nodes_)
+    {
+      auto wit = sol->weight_.find(node);
+      if (wit == sol->weight_.end() || wit->second <= 0)
+        continue;
+      auto sit = sol->sol_.find(node);
+      if (sit == sol->sol_.end() || sit->second == nullptr)
+        continue;
+      pCut cut = sit->second;
+      size_t csz = cut->cutsize();
+      switch (cut->getType())
+      {
+      case Cut::General:
+        if (csz >= 1 && csz <= sol->lut_num_.size())
+          ++sol->lut_num_[csz - 1];
+        break;
+      case Cut::Cut7: sol->lut_num_[5] += 2; break;
+      case Cut::Cut8: sol->lut_num_[5] += 4; break;
+      case Cut::Cut9: sol->lut_num_[5] += 8; break;
+      }
+    }
+
+    if (budget_limited)
+      std::cout << "AGD exact recovery: evaluation budget " << max_evals
+                << " reached; retained committed incumbent\n";
+    std::cout << "AGD exact recovery: area " << old_area << " -> " << area
+              << " (-" << (old_area - area) << "), " << commits
+              << " commit(s), " << evaluations << " evaluation(s), "
+              << pruned << " pruned, "
+              << (sweeps + 1) << " sweep(s), recount " << final_check
+              << ", budget_limited=" << (budget_limited ? 1 : 0) << "\n";
+    return true;
   }
 
   Depth Mapper::getIdealDepth()
