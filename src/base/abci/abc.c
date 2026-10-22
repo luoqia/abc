@@ -5480,6 +5480,7 @@ int Abc_CommandLutpack( Abc_Frame_t * pAbc, int argc, char ** argv )
     pPars->nGrowthLevel =  0; // (L) the maximum number of increased levels
     pPars->fSatur       =  1;
     pPars->fZeroCost    =  0;
+    pPars->fRelaxed     =  0;
     pPars->fFirst       =  0;
     pPars->fOldAlgo     =  0;
     pPars->fVerbose     =  0;
@@ -5497,7 +5498,7 @@ int Abc_CommandLutpack( Abc_Frame_t * pAbc, int argc, char ** argv )
             pPars->nWorkers = nWorkers;
     }
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "NQSLszfovwh" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "NQSLszrfovwh" ) ) != EOF )
     {
         switch ( c )
         {
@@ -5551,6 +5552,9 @@ int Abc_CommandLutpack( Abc_Frame_t * pAbc, int argc, char ** argv )
         case 'z':
             pPars->fZeroCost ^= 1;
             break;
+        case 'r':
+            pPars->fRelaxed ^= 1;
+            break;
         case 'f':
             pPars->fFirst ^= 1;
             break;
@@ -5595,7 +5599,7 @@ int Abc_CommandLutpack( Abc_Frame_t * pAbc, int argc, char ** argv )
     return 0;
 
 usage:
-    Abc_Print( -2, "usage: lutpack [-NQSL <num>] [-szfovwh]\n" );
+    Abc_Print( -2, "usage: lutpack [-NQSL <num>] [-szrfovwh]\n" );
     Abc_Print( -2, "\t           performs \"rewriting\" for LUT network;\n" );
     Abc_Print( -2, "\t           determines LUT size as the max fanin count of a node;\n" );
     Abc_Print( -2, "\t           if the network is not LUT-mapped, packs it into 6-LUTs\n" );
@@ -5606,6 +5610,7 @@ usage:
     Abc_Print( -2, "\t-L <num> : max level increase after resynthesis (0 <= num) [default = %d]\n", pPars->nGrowthLevel );
     Abc_Print( -2, "\t-s       : toggle iteration till saturation [default = %s]\n", pPars->fSatur? "yes": "no" );
     Abc_Print( -2, "\t-z       : toggle zero-cost replacements [default = %s]\n", pPars->fZeroCost? "yes": "no" );
+    Abc_Print( -2, "\t-r       : toggle re-evaluating invalidated pivots in parallel waves (not depth-preserving) [default = %s]\n", pPars->fRelaxed? "yes": "no" );
     Abc_Print( -2, "\t-f       : toggle using only first node and first cut [default = %s]\n", pPars->fFirst? "yes": "no" );
     Abc_Print( -2, "\t-o       : toggle using old implementation [default = %s]\n", pPars->fOldAlgo? "yes": "no" );
     Abc_Print( -2, "\t-v       : toggle verbose printout [default = %s]\n", pPars->fVerbose? "yes": "no" );
@@ -41297,7 +41302,7 @@ int Abc_CommandAbc9Synch2( Abc_Frame_t * pAbc, int argc, char ** argv )
     Dch_ManSetDefaultParams( pPars );
     pPars->nBTLimit = 100;
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "WCSKRfrtvh" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "WCSKRJfrtvh" ) ) != EOF )
     {
         switch ( c )
         {
@@ -41356,6 +41361,17 @@ int Abc_CommandAbc9Synch2( Abc_Frame_t * pAbc, int argc, char ** argv )
             if ( nRelaxRatio < 0 )
                 goto usage;
             break;
+        case 'J':
+            if ( globalUtilOptind >= argc )
+            {
+                Abc_Print( -1, "Command line switch \"-J\" should be followed by an integer.\n" );
+                goto usage;
+            }
+            pPars->nProcs = atoi(argv[globalUtilOptind]);
+            globalUtilOptind++;
+            if ( pPars->nProcs < 0 || pPars->nProcs > 256 )
+                goto usage;
+            break;
         case 'f':
             pPars->fLightSynth ^= 1;
             break;
@@ -41384,13 +41400,14 @@ int Abc_CommandAbc9Synch2( Abc_Frame_t * pAbc, int argc, char ** argv )
     return 0;
 
 usage:
-    Abc_Print( -2, "usage: &synch2 [-WCSKR num] [-frtvh]\n" );
+    Abc_Print( -2, "usage: &synch2 [-WCSKRJ num] [-frtvh]\n" );
     Abc_Print( -2, "\t         computes structural choices using a new approach\n" );
     Abc_Print( -2, "\t-W num : the max number of simulation words [default = %d]\n", pPars->nWords );
     Abc_Print( -2, "\t-C num : the max number of conflicts at a node [default = %d]\n", pPars->nBTLimit );
     Abc_Print( -2, "\t-S num : the max number of SAT variables [default = %d]\n", pPars->nSatVarMax );
     Abc_Print( -2, "\t-K num : the target LUT size for downstream mapping [default = %d]\n", nLutSize );
     Abc_Print( -2, "\t-R num : the delay relaxation ratio (num >= 0) [default = %d]\n",   nRelaxRatio );
+    Abc_Print( -2, "\t-J num : sweep output groups in this many parallel processes [default = %d]\n", pPars->nProcs );
     Abc_Print( -2, "\t-f     : toggle using lighter logic synthesis [default = %s]\n", pPars->fLightSynth? "yes": "no" );
     Abc_Print( -2, "\t-r     : toggle skipping choices with redundant support [default = %s]\n", pPars->fSkipRedSupp? "yes": "no" );
     Abc_Print( -2, "\t-t     : toggle simulation of the TFO classes after a counter-example [default = %s]\n", pPars->fSimulateTfo? "yes": "no" );

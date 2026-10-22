@@ -131,6 +131,7 @@ typedef struct Lpk_ParPass_t_
     Abc_Ntk_t *    pNtk;
     int *          vPivots;     // phase-A offered pivot ids
     char *         pOffered;    // per-node-id offered bitmap (phase A list)
+    int            nChunkPivots; // pivots per evaluation chunk
     int            nNodes;
     Lpk_ParRec_t ** ppRecs;     // per-node-id records
     int            nPivots;
@@ -154,6 +155,7 @@ typedef struct Lpk_ParPass_t_
     int            nCommittedSerial;  // accepted after serial re-evaluation
     int            nDeferredPivots;
     int            nDriftedPivots;
+    int            nSkippedPivots;  // relaxed mode: pivots re-evaluated in later waves
     int            nSelftestFp;       // LUTPACK_SELFTEST_FP corruptions applied
 } Lpk_ParPass_t;
 
@@ -1229,8 +1231,8 @@ static void Lpk_ParCtxStop( Lpk_ParCtx_t * pC )
 static void Lpk_ParWorkerChunk( Lpk_ParPass_t * pPass, Lpk_ParCtx_t * pC, int iChunk )
 {
     int i, iStart, iStop, v;
-    iStart = iChunk * LPK_PAR_CHUNK_PIVOTS;
-    iStop = iStart + LPK_PAR_CHUNK_PIVOTS;
+    iStart = iChunk * pPass->nChunkPivots;
+    iStop = iStart + pPass->nChunkPivots;
     if ( iStop > pPass->nPivots )
         iStop = pPass->nPivots;
     for ( i = iStart; i < iStop; i++ )
@@ -1279,6 +1281,7 @@ typedef struct Lpk_ParThr_t_
 {
     Lpk_ParPass_t * pPass;
     Lpk_ParCtx_t *  pC;
+    int             iWorker;
 } Lpk_ParThr_t;
 
 #ifdef ABC_USE_PTHREADS
@@ -1286,6 +1289,8 @@ static void * Lpk_ParWorkerThr( void * pArg )
 {
     Lpk_ParThr_t * pThr = (Lpk_ParThr_t *)pArg;
     int iChunk;
+    // each worker allocates and clears its own scratch, in parallel
+    pThr->pC = Lpk_ParCtxStart( pThr->iWorker, pThr->pPass );
     while ( 1 )
     {
         iChunk = __sync_fetch_and_add( &pThr->pPass->NextChunk, 1 );
@@ -1325,7 +1330,11 @@ static void Lpk_ParEvalPhase( Lpk_ParPass_t * pPass )
 #endif
     if ( pPass->nPivots == 0 )
         return;
-    pPass->nChunks = (pPass->nPivots + LPK_PAR_CHUNK_PIVOTS - 1) / LPK_PAR_CHUNK_PIVOTS;
+    // aim for several chunks per worker, so that small re-evaluation waves
+    // (whose pivots are the expensive ones) still use every worker
+    pPass->nChunkPivots = pPass->nPivots / (8 * (pPass->nWorkers > 0 ? pPass->nWorkers : 1));
+    pPass->nChunkPivots = Abc_MaxInt( 16, Abc_MinInt( LPK_PAR_CHUNK_PIVOTS, pPass->nChunkPivots ) );
+    pPass->nChunks = (pPass->nPivots + pPass->nChunkPivots - 1) / pPass->nChunkPivots;
 #ifdef ABC_USE_PTHREADS
     nThr = pPass->nWorkers - 1;
     if ( getenv("LUTPACK_DEBUG3") )
@@ -1342,7 +1351,8 @@ static void Lpk_ParEvalPhase( Lpk_ParPass_t * pPass )
         for ( i = 0; i < nThr; i++ )
         {
             pThrs[i].pPass = pPass;
-            pThrs[i].pC = Lpk_ParCtxStart( i + 1, pPass );
+            pThrs[i].pC = NULL;
+            pThrs[i].iWorker = i + 1;
             if ( pthread_create( pThreads + i, NULL, Lpk_ParWorkerThr, pThrs + i ) != 0 )
                 break;
         }
@@ -1386,6 +1396,7 @@ static void Lpk_ParEvalPhase( Lpk_ParPass_t * pPass )
 static int Lpk_ParDrifted( Lpk_ParPass_t * pPass, Lpk_ParRec_t * pRec, int vPivot )
 {
     Abc_Ntk_t * pNtk = pPass->pNtk;
+    int fRelaxed = pPass->p->pPars->fRelaxed;
     int i, v, nLevel;
     Abc_Obj_t * pObj;
     Vec_IntForEachEntry( pRec->vWin, v, i )
@@ -1403,13 +1414,14 @@ static int Lpk_ParDrifted( Lpk_ParPass_t * pPass, Lpk_ParRec_t * pRec, int vPivo
         if ( v >= Abc_NtkObjNumMax(pNtk) )
             return 1;
         pObj = Abc_NtkObj( pNtk, v );
-        if ( pObj == NULL || Abc_ObjLevel(pObj) != nLevel )
+        if ( pObj == NULL || (!fRelaxed && Abc_ObjLevel(pObj) != nLevel) )
             return 1;
     }
     if ( vPivot >= Abc_NtkObjNumMax(pNtk) )
         return 1;
     pObj = Abc_NtkObj( pNtk, vPivot );
-    if ( pObj == NULL || Abc_ObjRequiredLevel(pObj) != pRec->Required )
+    // relaxed mode does not hold depth, so only structural drift counts
+    if ( pObj == NULL || (!fRelaxed && Abc_ObjRequiredLevel(pObj) != pRec->Required) )
         return 1;
     // Task 81 Q1 repair: compare every recorded window/leaf node's exact live
     // structure (fanin count, phase bits, every fanin id) against the record
@@ -1470,7 +1482,7 @@ static void Lpk_ParCommitPlan( Lpk_ParPass_t * pPass, Lpk_ParRec_t * pRec, int v
         nNodesAft = Abc_NtkNodeNum( pNtk );
         assert( pObjNew != NULL );
         assert( nNodesAft - nNodesBef == pRec->nFuns );
-        assert( Abc_ObjLevel(pObjNew) <= pRec->Required );
+        assert( p->pPars->fRelaxed || Abc_ObjLevel(pObjNew) <= pRec->Required );
     }
     nGain = pRec->nNodes - pRec->nNodesDup - (nNodesAft - nNodesBef);
     p->nGainTotal += nGain;
@@ -1566,6 +1578,164 @@ static void Lpk_ParCommitPhase( Lpk_ParPass_t * pPass )
                 pPass->nCommittedSerial++;
         }
     }
+}
+
+/* Relaxed commit: pivots whose context drifted are not re-evaluated
+   serially in place. They are collected and re-evaluated in parallel
+   against the updated network (a "wave"), and committed in pivot order
+   after validation, until few remain; that remainder is handled serially.
+   Every commit is still validated against the live network, so the
+   result is a correct LUT network, but no longer identical to the serial
+   sweep (a drifted pivot is committed after later pivots, not before). */
+#define LPK_PAR_WAVES_MAX     8
+#define LPK_PAR_WAVE_MIN      512
+static void Lpk_ParCommitPhaseWaves( Lpk_ParPass_t * pPass )
+{
+    Lpk_Man_t * p = pPass->p;
+    Abc_Ntk_t * pNtk = pPass->pNtk;
+    Vec_Int_t * vWave = Vec_IntAllocArray( pPass->vPivots, pPass->nPivots );
+    Vec_Int_t * vNext;
+    Abc_Obj_t * pObj;
+    Lpk_ParRec_t * pRec;
+    int i, v, iWave, fLast;
+    int nPivots0 = pPass->nPivots;
+    pPass->vPivots = NULL;
+    for ( iWave = 0; ; iWave++ )
+    {
+        fLast = iWave + 1 >= LPK_PAR_WAVES_MAX;
+        vNext = Vec_IntAlloc( 1000 );
+        if ( iWave == 0 )
+        {
+            // first sweep covers the whole node range like the serial pass
+            for ( v = 0; v < pPass->nNodes; v++ )
+            {
+                pObj = Abc_NtkObj( pNtk, v );
+                if ( pObj == NULL || !Abc_ObjIsNode(pObj) )
+                    continue;
+                if ( !pPass->pOffered[v] )
+                {
+                    if ( p->pPars->fFirst && !Abc_ObjIsCo(Abc_ObjFanout0(pObj)) )
+                        continue;
+                    if ( p->pPars->fSatur && !Lpk_NodeHasChanged( p, v ) )
+                        continue;
+                    pPass->pOffered[v] = 1;
+                    Vec_IntPush( vNext, v );
+                    continue;
+                }
+                if ( pPass->pDeferred[v] )
+                {
+                    p->pObj = pObj;
+                    Lpk_ResynthesizeNodeNew( p );
+                    pPass->nDeferredPivots++;
+                    continue;
+                }
+                pRec = pPass->ppRecs[v];
+                if ( pRec == NULL )
+                    continue;
+                if ( !Lpk_ParDrifted( pPass, pRec, v ) )
+                {
+                    int nChangesBef = p->nChanges;
+                    if ( pRec->fPlan )
+                        Lpk_ParCommitPlan( pPass, pRec, v );
+                    if ( p->nChanges != nChangesBef )
+                        pPass->nCommittedNew++;
+                }
+                else
+                {
+                    pPass->nDriftedPivots++;
+                    Vec_IntPush( vNext, v );
+                }
+            }
+        }
+        else
+        {
+            Vec_IntForEachEntry( vWave, v, i )
+            {
+                pObj = Abc_NtkObj( pNtk, v );
+                if ( pObj == NULL || !Abc_ObjIsNode(pObj) )
+                    continue;
+                pRec = pPass->ppRecs[v];
+                if ( pPass->pDeferred[v] || (pRec != NULL && Lpk_ParDrifted( pPass, pRec, v )) )
+                {
+                    if ( fLast || pPass->pDeferred[v] )
+                    {
+                        int nChangesBef = p->nChanges;
+                        if ( pRec ) Lpk_ParRecFreePlan( pRec );
+                        p->pObj = pObj;
+                        Lpk_ResynthesizeNodeNew( p );
+                        if ( p->nChanges != nChangesBef )
+                            pPass->nCommittedSerial++;
+                    }
+                    else
+                        Vec_IntPush( vNext, v );
+                    continue;
+                }
+                if ( pRec && pRec->fPlan )
+                {
+                    int nChangesBef = p->nChanges;
+                    Lpk_ParCommitPlan( pPass, pRec, v );
+                    if ( p->nChanges != nChangesBef )
+                        pPass->nCommittedNew++;
+                }
+            }
+        }
+        Vec_IntFree( vWave );
+        vWave = vNext;
+        if ( Vec_IntSize(vWave) == 0 || fLast )
+            break;
+        // re-evaluate the next wave on the live network; later commits of
+        // the previous wave may have removed some of its pivots
+        {
+            int k = 0;
+            Vec_IntForEachEntry( vWave, v, i )
+            {
+                pObj = Abc_NtkObj( pNtk, v );
+                if ( pObj != NULL && Abc_ObjIsNode(pObj) )
+                    Vec_IntWriteEntry( vWave, k++, v );
+                else if ( pPass->ppRecs[v] )
+                {
+                    Lpk_ParRecFree( pPass->ppRecs[v] );
+                    pPass->ppRecs[v] = NULL;
+                }
+            }
+            Vec_IntShrink( vWave, k );
+        }
+        Vec_IntForEachEntry( vWave, v, i )
+        {
+            pPass->pDeferred[v] = 0;
+            if ( pPass->ppRecs[v] )
+            {
+                Lpk_ParRecFree( pPass->ppRecs[v] );
+                pPass->ppRecs[v] = NULL;
+            }
+        }
+        if ( Vec_IntSize(vWave) < LPK_PAR_WAVE_MIN )
+        {
+            // too small to pay for a parallel phase: finish serially
+            Vec_IntForEachEntry( vWave, v, i )
+            {
+                int nChangesBef = p->nChanges;
+                pObj = Abc_NtkObj( pNtk, v );
+                if ( pObj == NULL || !Abc_ObjIsNode(pObj) )
+                    continue;
+                p->pObj = pObj;
+                Lpk_ResynthesizeNodeNew( p );
+                if ( p->nChanges != nChangesBef )
+                    pPass->nCommittedSerial++;
+            }
+            break;
+        }
+        pPass->vPivots = Vec_IntArray( vWave );
+        pPass->nPivots = Vec_IntSize( vWave );
+        pPass->NextChunk = 0;
+        pPass->nSkippedPivots += pPass->nPivots;
+        Lpk_ParEvalPhase( pPass );
+        pPass->vPivots = NULL;
+    }
+    Vec_IntFree( vWave );
+    pPass->nPivots = nPivots0;
+    if ( getenv("LUTPACK_DEBUG") )
+        printf( "[lpkpar] waves=%d re-evaluated=%d\n", iWave + 1, pPass->nSkippedPivots );
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -1698,8 +1868,11 @@ int Lpk_PassPar( Lpk_Man_t * p, int nNodes, int nWorkers )
     // parallel evaluation phase
     if ( !getenv("LUTPACK_NOEVAL") )
         Lpk_ParEvalPhase( &Pass );
-    // serial validated commit / re-evaluation sweep
-    Lpk_ParCommitPhase( &Pass );
+    // serial validated commit / re-evaluation sweep (or parallel waves)
+    if ( p->pPars->fRelaxed )
+        Lpk_ParCommitPhaseWaves( &Pass );
+    else
+        Lpk_ParCommitPhase( &Pass );
     if ( getenv("LUTPACK_DEBUG") )
     {
         int nEnum = 0, nPlan = 0, nComm = 0;

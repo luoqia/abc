@@ -23,6 +23,11 @@
 #include "base/cmd/cmd.h"
 #include "proof/dch/dch.h"
 #include "opt/dau/dau.h"
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 ABC_NAMESPACE_IMPL_START
 
@@ -371,6 +376,224 @@ Gia_Man_t * Gia_ManDupToBarBufs( Gia_Man_t * p, int nBarBufs )
   SeeAlso     []
 
 ***********************************************************************/
+/**Function*************************************************************
+
+  Synopsis    [Parallel choice computation for &synch2 -J.]
+
+  Description [The choice miter holds nSnap snapshots of every output,
+  output-major. Its outputs are split into contiguous groups of similar
+  size; each group's cone, across all snapshots, is copied into its own
+  AIG and swept by Dch in a forked child, which returns the proven
+  equivalences as pairs of global node ids through shared memory. The
+  parent unions them (the representative is the earliest node) and derives
+  the choice AIG once, as the serial Dch_ComputeChoices does. An
+  equivalence proven inside a cone holds globally, so correctness does not
+  depend on the grouping; pairs that only meet across groups are missed.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+#ifndef _WIN32
+static void Gia_ManSynch2ParDup_rec( Aig_Man_t * pNew, Aig_Obj_t * pObj, Vec_Int_t * vMap )
+{
+    Aig_Obj_t * pObjNew;
+    if ( pObj->pData )
+        return;
+    assert( Aig_ObjIsNode(pObj) );
+    Gia_ManSynch2ParDup_rec( pNew, Aig_ObjFanin0(pObj), vMap );
+    Gia_ManSynch2ParDup_rec( pNew, Aig_ObjFanin1(pObj), vMap );
+    // no structural hashing: every copied node keeps its own id
+    pObjNew = Aig_ObjCreate( pNew, Aig_ObjCreateGhost( pNew, Aig_ObjChild0Copy(pObj), Aig_ObjChild1Copy(pObj), AIG_OBJ_AND ) );
+    pObj->pData = pObjNew;
+    Vec_IntSetEntry( vMap, Aig_ObjId(pObjNew), Aig_ObjId(pObj) );
+}
+static int Gia_ManSynch2ParFind( int * pPar, int i )
+{
+    while ( pPar[i] != i )
+        i = pPar[i] = pPar[pPar[i]];
+    return i;
+}
+static Aig_Man_t * Gia_ManSynch2ChoicesPar( Gia_Man_t * pMiter, int nSnap, Dch_Pars_t * pPars )
+{
+    extern void Gia_ManToAig_rec( Aig_Man_t * pNew, Aig_Obj_t ** ppNodes, Gia_Man_t * p, Gia_Obj_t * pObj );
+    extern Aig_Man_t * Dch_DeriveChoiceAig( Aig_Man_t * pAig, int fSkipRedSupps );
+    Aig_Man_t * pMan, * pRes;
+    Aig_Obj_t ** ppNodes, ** ppRoots;
+    Gia_Obj_t * pObj;
+    Vec_Int_t * vOwned;
+    int * pPar, ** ppBufs, * pStart, * pPids;
+    int i, k, g, nOuts, nGroups, nObjs, nRunning = 0, nNext = 0, nFailed = 0, nPairs = 0;
+    long nCap;
+    abctime clk = Abc_Clock();
+    assert( Gia_ManCoNum(pMiter) % nSnap == 0 );
+    nOuts = Gia_ManCoNum(pMiter) / nSnap;
+    // global AIG, built exactly as Gia_ManToAigSkip() does, keeping the map
+    pMan = Aig_ManStart( Gia_ManAndNum(pMiter) );
+    pMan->pName = Abc_UtilStrsav( pMiter->pName );
+    pMan->pSpec = Abc_UtilStrsav( pMiter->pSpec );
+    ppNodes = ABC_CALLOC( Aig_Obj_t *, Gia_ManObjNum(pMiter) );
+    ppNodes[0] = Aig_ManConst0(pMan);
+    Gia_ManForEachCi( pMiter, pObj, i )
+        ppNodes[Gia_ObjId(pMiter, pObj)] = Aig_ObjCreateCi( pMan );
+    ppRoots = ABC_CALLOC( Aig_Obj_t *, Gia_ManCoNum(pMiter) );
+    vOwned = Vec_IntAlloc( nOuts + 1 );   // object count after each output
+    Gia_ManForEachCo( pMiter, pObj, i )
+    {
+        Gia_ManToAig_rec( pMan, ppNodes, pMiter, Gia_ObjFanin0(pObj) );
+        ppRoots[i] = Aig_NotCond( ppNodes[Gia_ObjFaninId0p(pMiter, pObj)], Gia_ObjFaninC0(pObj) );
+        if ( i % nSnap == nSnap - 1 )
+            Vec_IntPush( vOwned, Aig_ManObjNumMax(pMan) );
+        if ( i % nSnap != 0 )
+            continue;
+        ppNodes[Gia_ObjId(pMiter, pObj)] = Aig_ObjCreateCo( pMan, ppRoots[i] );
+    }
+    Aig_ManSetRegNum( pMan, Gia_ManRegNum(pMiter) );
+    ABC_FREE( ppNodes );
+    nObjs = Aig_ManObjNumMax( pMan );
+    // contiguous output groups of similar newly-created size
+    nGroups = Abc_MinInt( pPars->nProcs, nOuts );
+    pStart = ABC_ALLOC( int, nGroups + 1 );
+    pStart[0] = 0;
+    for ( g = 1, k = 0; g < nGroups; g++ )
+    {
+        int Target = (int)((long)nObjs * g / nGroups);
+        while ( k < nOuts - 1 && Vec_IntEntry(vOwned, k) < Target )
+            k++;
+        pStart[g] = Abc_MaxInt( pStart[g-1], k );
+    }
+    pStart[nGroups] = nOuts;
+    Vec_IntFree( vOwned );
+    // shared result buffers: [0] = status (1 = done), [1] = pair count, pairs
+    nCap = 2L * nObjs + 2;
+    ppBufs = ABC_CALLOC( int *, nGroups );
+    pPids = ABC_CALLOC( int, nGroups );
+    for ( g = 0; g < nGroups; g++ )
+    {
+        ppBufs[g] = (int *)mmap( NULL, sizeof(int) * nCap, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0 );
+        if ( ppBufs[g] == MAP_FAILED )
+            ppBufs[g] = NULL;
+    }
+    fflush( stdout );
+    while ( nNext < nGroups || nRunning > 0 )
+    {
+        while ( nNext < nGroups && nRunning < pPars->nProcs )
+        {
+            g = nNext++;
+            if ( ppBufs[g] == NULL || (pPids[g] = fork()) < 0 )
+            {
+                pPids[g] = 0;
+                nFailed++;
+                continue;
+            }
+            if ( pPids[g] == 0 )
+            {
+                // child: sweep the cone of this group's outputs
+                Aig_Man_t * pSub = Aig_ManStart( 1000 );
+                Vec_Int_t * vMap = Vec_IntStart( 1000 );
+                Aig_Obj_t * pAigObj, * pRepr;
+                Dch_Pars_t Pars = *pPars;
+                int * pBuf = ppBufs[g], nOut = 0;
+                Pars.fVerbose = 0;
+                Aig_ManCleanData( pMan );
+                Aig_ManConst1(pMan)->pData = Aig_ManConst1(pSub);
+                Aig_ManForEachCi( pMan, pAigObj, i )
+                {
+                    pAigObj->pData = Aig_ObjCreateCi( pSub );
+                    Vec_IntSetEntry( vMap, Aig_ObjId((Aig_Obj_t *)pAigObj->pData), Aig_ObjId(pAigObj) );
+                }
+                for ( k = pStart[g] * nSnap; k < pStart[g+1] * nSnap; k++ )
+                {
+                    Gia_ManSynch2ParDup_rec( pSub, Aig_Regular(ppRoots[k]), vMap );
+                    Aig_ObjCreateCo( pSub, Aig_NotCond( (Aig_Obj_t *)Aig_Regular(ppRoots[k])->pData, Aig_IsComplement(ppRoots[k]) ) );
+                }
+                Dch_ComputeEquivalences( pSub, &Pars );
+                Aig_ManForEachObj( pSub, pAigObj, i )
+                {
+                    if ( (pRepr = Aig_ObjRepr( pSub, pAigObj )) == NULL )
+                        continue;
+                    pBuf[2 + 2 * nOut]     = Vec_IntEntry( vMap, Aig_ObjId(pAigObj) );
+                    pBuf[2 + 2 * nOut + 1] = Aig_ObjIsConst1(pRepr) ? 0 : Vec_IntEntry( vMap, Aig_ObjId(pRepr) );
+                    nOut++;
+                }
+                pBuf[1] = nOut;
+                pBuf[0] = 1;
+                _exit( 0 );
+            }
+            nRunning++;
+        }
+        if ( nRunning > 0 )
+        {
+            int Status, Pid = wait( &Status );
+            if ( Pid < 0 )
+                break;
+            for ( g = 0; g < nGroups; g++ )
+                if ( pPids[g] == Pid )
+                {
+                    pPids[g] = 0;
+                    if ( !WIFEXITED(Status) || WEXITSTATUS(Status) != 0 || ppBufs[g][0] != 1 )
+                        nFailed++;
+                    break;
+                }
+            nRunning--;
+        }
+    }
+    ABC_FREE( ppRoots );
+    if ( nFailed )
+    {
+        // a lost group would only lose choices, but keep the result identical
+        // to what the serial engine guarantees: fall back to it
+        printf( "&synch2 -J: %d of %d groups failed; computing choices serially.\n", nFailed, nGroups );
+        for ( g = 0; g < nGroups; g++ )
+            if ( ppBufs[g] )
+                munmap( ppBufs[g], sizeof(int) * nCap );
+        ABC_FREE( ppBufs ); ABC_FREE( pPids ); ABC_FREE( pStart );
+        pRes = Dch_ComputeChoices( pMan, pPars );
+        Aig_ManStop( pMan );
+        return pRes;
+    }
+    // union the proven equivalences; the representative is the earliest node
+    pPar = ABC_ALLOC( int, nObjs );
+    for ( i = 0; i < nObjs; i++ )
+        pPar[i] = i;
+    for ( g = 0; g < nGroups; g++ )
+    {
+        int * pBuf = ppBufs[g];
+        for ( k = 0; k < pBuf[1]; k++ )
+        {
+            int a = Gia_ManSynch2ParFind( pPar, pBuf[2 + 2*k] );
+            int b = Gia_ManSynch2ParFind( pPar, pBuf[2 + 2*k + 1] );
+            if ( a != b )
+            {
+                if ( a < b ) pPar[b] = a; else pPar[a] = b;
+            }
+        }
+        nPairs += pBuf[1];
+        munmap( ppBufs[g], sizeof(int) * nCap );
+    }
+    Aig_ManReprStart( pMan, nObjs );
+    for ( i = 0; i < nObjs; i++ )
+    {
+        int r = Gia_ManSynch2ParFind( pPar, i );
+        Aig_Obj_t * pAigObj = Aig_ManObj( pMan, i );
+        if ( r == i || pAigObj == NULL || !Aig_ObjIsNode(pAigObj) )
+            continue;
+        Aig_ObjSetRepr( pMan, pAigObj, Aig_ManObj(pMan, r) );
+    }
+    ABC_FREE( pPar ); ABC_FREE( ppBufs ); ABC_FREE( pPids ); ABC_FREE( pStart );
+    if ( pPars->fVerbose )
+    {
+        printf( "&synch2 -J %d: %d groups, %d proven pairs.  ", pPars->nProcs, nGroups, nPairs );
+        Abc_PrintTime( 1, "Parallel sweep time", Abc_Clock() - clk );
+    }
+    ABC_FREE( pMan->pTable );
+    pRes = Dch_DeriveChoiceAig( pMan, pPars->fSkipRedSupp );
+    Aig_ManStop( pMan );
+    return pRes;
+}
+#endif
+
 Gia_Man_t * Gia_ManAigSynch2Choices( Gia_Man_t * pGia1, Gia_Man_t * pGia2, Gia_Man_t * pGia3, Dch_Pars_t * pPars )
 {
     Aig_Man_t * pMan, * pTemp;
@@ -382,12 +605,22 @@ Gia_Man_t * Gia_ManAigSynch2Choices( Gia_Man_t * pGia1, Gia_Man_t * pGia2, Gia_M
     if ( pGia1 ) Vec_PtrPush( vGias, pGia1 );
     pMiter = Gia_ManChoiceMiter( vGias );
     Vec_PtrFree( vGias );
+#ifndef _WIN32
+    if ( pPars->nProcs > 1 )
+    {
+        pMan = Gia_ManSynch2ChoicesPar( pMiter, 3, pPars );
+        Gia_ManStop( pMiter );
+    }
+    else
+#endif
+    {
     // transform into an AIG
     pMan = Gia_ManToAigSkip( pMiter, 3 );
     Gia_ManStop( pMiter );
     // compute choices
     pMan = Dch_ComputeChoices( pTemp = pMan, pPars );
     Aig_ManStop( pTemp );
+    }
     // reconstruct the network
     vPios = Gia_ManOrderPios( pMan, pGia1 ); 
     pMan = Aig_ManDupDfsGuided( pTemp = pMan, vPios );
