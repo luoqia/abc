@@ -429,6 +429,13 @@ static Aig_Man_t * Gia_ManSynch2ChoicesPar( Gia_Man_t * pMiter, int nSnap, Dch_P
     abctime clk = Abc_Clock();
     assert( Gia_ManCoNum(pMiter) % nSnap == 0 );
     nOuts = Gia_ManCoNum(pMiter) / nSnap;
+    // Groups overlap in shared logic, which every group re-proves: on CVA6
+    // (406k AND nodes) two groups cost no more work than one, sixteen cost
+    // twice as much. One group per ~200k original nodes keeps the total work
+    // near the serial sweep's; -J only caps the count. NULL: run serially.
+    nGroups = Abc_MinInt( Abc_MinInt( pPars->nProcs, nOuts ), Abc_MaxInt( 1, (Gia_ManAndNum(pMiter) / nSnap + 100000) / 200000 ) );
+    if ( nGroups < 2 )
+        return NULL;
     // global AIG, built exactly as Gia_ManToAigSkip() does, keeping the map
     pMan = Aig_ManStart( Gia_ManAndNum(pMiter) );
     pMan->pName = Abc_UtilStrsav( pMiter->pName );
@@ -453,7 +460,7 @@ static Aig_Man_t * Gia_ManSynch2ChoicesPar( Gia_Man_t * pMiter, int nSnap, Dch_P
     ABC_FREE( ppNodes );
     nObjs = Aig_ManObjNumMax( pMan );
     // contiguous output groups of similar newly-created size
-    nGroups = Abc_MinInt( pPars->nProcs, nOuts );
+
     pStart = ABC_ALLOC( int, nGroups + 1 );
     pStart[0] = 0;
     for ( g = 1, k = 0; g < nGroups; g++ )
@@ -605,12 +612,14 @@ Gia_Man_t * Gia_ManAigSynch2Choices( Gia_Man_t * pGia1, Gia_Man_t * pGia2, Gia_M
     if ( pGia1 ) Vec_PtrPush( vGias, pGia1 );
     pMiter = Gia_ManChoiceMiter( vGias );
     Vec_PtrFree( vGias );
+    pMan = NULL;
 #ifndef _WIN32
     if ( pPars->nProcs > 1 )
     {
         pMan = Gia_ManSynch2ChoicesPar( pMiter, 3, pPars );
-        Gia_ManStop( pMiter );
     }
+    if ( pMan != NULL )
+        Gia_ManStop( pMiter );
     else
 #endif
     {

@@ -5610,7 +5610,7 @@ usage:
     Abc_Print( -2, "\t-L <num> : max level increase after resynthesis (0 <= num) [default = %d]\n", pPars->nGrowthLevel );
     Abc_Print( -2, "\t-s       : toggle iteration till saturation [default = %s]\n", pPars->fSatur? "yes": "no" );
     Abc_Print( -2, "\t-z       : toggle zero-cost replacements [default = %s]\n", pPars->fZeroCost? "yes": "no" );
-    Abc_Print( -2, "\t-r       : toggle re-evaluating invalidated pivots in parallel waves (not depth-preserving) [default = %s]\n", pPars->fRelaxed? "yes": "no" );
+    Abc_Print( -2, "\t-r       : toggle level-batched parallel evaluation and commits (not depth-preserving) [default = %s]\n", pPars->fRelaxed? "yes": "no" );
     Abc_Print( -2, "\t-f       : toggle using only first node and first cut [default = %s]\n", pPars->fFirst? "yes": "no" );
     Abc_Print( -2, "\t-o       : toggle using old implementation [default = %s]\n", pPars->fOldAlgo? "yes": "no" );
     Abc_Print( -2, "\t-v       : toggle verbose printout [default = %s]\n", pPars->fVerbose? "yes": "no" );
@@ -41407,7 +41407,7 @@ usage:
     Abc_Print( -2, "\t-S num : the max number of SAT variables [default = %d]\n", pPars->nSatVarMax );
     Abc_Print( -2, "\t-K num : the target LUT size for downstream mapping [default = %d]\n", nLutSize );
     Abc_Print( -2, "\t-R num : the delay relaxation ratio (num >= 0) [default = %d]\n",   nRelaxRatio );
-    Abc_Print( -2, "\t-J num : sweep output groups in this many parallel processes [default = %d]\n", pPars->nProcs );
+    Abc_Print( -2, "\t-J num : sweep output groups in up to this many parallel processes (one group per ~200k nodes) [default = %d]\n", pPars->nProcs );
     Abc_Print( -2, "\t-f     : toggle using lighter logic synthesis [default = %s]\n", pPars->fLightSynth? "yes": "no" );
     Abc_Print( -2, "\t-r     : toggle skipping choices with redundant support [default = %s]\n", pPars->fSkipRedSupp? "yes": "no" );
     Abc_Print( -2, "\t-t     : toggle simulation of the TFO classes after a counter-example [default = %s]\n", pPars->fSimulateTfo? "yes": "no" );
