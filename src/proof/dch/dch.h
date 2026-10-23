@@ -60,6 +60,7 @@ struct Dch_Pars_t_
     abctime          timeSynth;     // synthesis runtime
     int              nNodesAhead;   // the lookahead in terms of nodes
     int              nCallsRecycle; // calls to perform before recycling SAT solver
+    int              nProcs;        // &synch2: output groups swept in parallel processes (0/1 = serial)
 };
 
 ////////////////////////////////////////////////////////////////////////
