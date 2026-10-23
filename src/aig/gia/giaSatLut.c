@@ -45,6 +45,8 @@ struct Sbl_Man_t_
     sat_solver *   pSat;         // SAT solver
     Vec_Int_t *    vCardVars;    // candinality variables
     int            nVars;        // max vars
+    int            RangeLo;      // parallel mode: windows must lie in [RangeLo, RangeHi)
+    int            RangeHi;
     int            LogN;         // base-2 log of max vars
     int            Power2;       // power-2 of LogN
     int            FirstVar;     // first variable to be used
@@ -1010,6 +1012,14 @@ int Sbl_ManTestSat( Sbl_Man_t * p, int iPivot )
         printf( "Skipping.\n" );
         return 0;
     }
+    if ( p->RangeHi > 0 )
+    {
+        // parallel mode: another process owns windows reaching outside the range
+        int iObj, k;
+        Vec_IntForEachEntry( p->vAnds, iObj, k )
+            if ( iObj < p->RangeLo || iObj >= p->RangeHi )
+                return 0;
+    }
 
     // derive cuts
     Sbl_ManComputeCuts( p );
@@ -1189,10 +1199,148 @@ void Sbl_ManPrintRuntime( Sbl_Man_t * p )
     ABC_PRTP( "Other ", p->timeOther,   p->timeTotal );
     ABC_PRTP( "ALL   ", p->timeTotal,   p->timeTotal );
 }
-void Gia_ManLutSat( Gia_Man_t * pGia, int LutSize, int nNumber, int nImproves, int nBTLimit, int DelayMax, int nEdges, int fDelay, int fReverse, int fVerbose, int fVeryVerbose )
+/**Function*************************************************************
+
+  Synopsis    [Parallel &satlut: node-id ranges in forked processes.]
+
+  Description [The LUT nodes are split into nProcs contiguous id ranges of
+  similar LUT count. Each forked child runs the serial sweep over the pivots
+  of its range and accepts only windows whose internal nodes all lie in the
+  range, so windows of different children never share internal nodes: a
+  window's leaves and roots stay mapped, and only its internal nodes change
+  their cuts. The children return the per-node cuts of their range through
+  shared memory, which the parent copies into its mapping. Windows reaching
+  across ranges are not tried. Returns 0 if a child failed (the mapping is
+  then unchanged).]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/wait.h>
+static int Gia_ManLutSatPar( Gia_Man_t * pGia, int LutSize, int nNumber, int nImproves, int nBTLimit, int DelayMax, int nEdges, int fDelay, int fReverse, int fVerbose, int nProcs )
+{
+    int nObjs = Gia_ManObjNum(pGia), nLuts = 0, g, i, k, iLut, nRunning = 0, nNext = 0, nFailed = 0;
+    int * pStart = ABC_ALLOC( int, nProcs + 1 ), * pPids = ABC_CALLOC( int, nProcs );
+    int ** ppBufs = ABC_CALLOC( int *, nProcs );
+    long nCap;
+    Vec_Int_t * vObj;
+    // the mapping in per-node form, as the serial sweep uses it
+    Gia_ManComputeOneWinStart( pGia, nNumber, fReverse );
+    Gia_ManForEachLut2( pGia, iLut )
+        nLuts++;
+    // ranges of similar LUT count
+    pStart[0] = 1;
+    for ( g = 1, k = 0, i = 1; i < nObjs && g < nProcs; i++ )
+        if ( Gia_ObjIsLut2(pGia, i) && ++k >= (long)nLuts * g / nProcs )
+            pStart[g++] = i + 1;
+    for ( ; g <= nProcs; g++ )
+        pStart[g] = nObjs;
+    // a range's cuts: one count and the fanins per node; a LUT4 cut has <= 6 fanins
+    nCap = 0;
+    for ( g = 0; g < nProcs; g++ )
+        nCap = Abc_MaxInt( nCap, 8L * (pStart[g+1] - pStart[g]) + 2 );
+    for ( g = 0; g < nProcs; g++ )
+    {
+        ppBufs[g] = (int *)mmap( NULL, sizeof(int) * nCap, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0 );
+        if ( ppBufs[g] == MAP_FAILED )
+            ppBufs[g] = NULL;
+    }
+    fflush( stdout );
+    while ( nNext < nProcs || nRunning > 0 )
+    {
+        while ( nNext < nProcs && nRunning < nProcs )
+        {
+            g = nNext++;
+            if ( ppBufs[g] == NULL || (pPids[g] = fork()) < 0 )
+            {
+                pPids[g] = 0;
+                nFailed++;
+                continue;
+            }
+            if ( pPids[g] == 0 )
+            {
+                Sbl_Man_t * p = Sbl_ManAlloc( pGia, nNumber );
+                int * pBuf = ppBufs[g], * pCur = pBuf + 1, nImproveCount = 0, iTemp;
+                p->LutSize = LutSize; p->nBTLimit = nBTLimit; p->DelayMax = DelayMax;
+                p->nEdges = nEdges; p->fDelay = fDelay; p->fReverse = fReverse;
+                p->RangeLo = pStart[g]; p->RangeHi = pStart[g+1];
+                if ( fDelay && pGia->vEdge1 && p->DelayMax == 0 )
+                    p->DelayMax = Gia_ManEvalEdgeDelay( pGia );
+                for ( iLut = pStart[g]; iLut < pStart[g+1]; iLut++ )
+                {
+                    if ( !Gia_ObjIsLut2(pGia, iLut) || Sbl_ManTestSat( p, iLut ) != 2 )
+                        continue;
+                    if ( ++nImproveCount == nImproves )
+                        break;
+                }
+                for ( i = pStart[g]; i < pStart[g+1]; i++ )
+                {
+                    vObj = Vec_WecEntry( pGia->vMapping2, i );
+                    if ( (long)(pCur - pBuf) + 1 + Vec_IntSize(vObj) > nCap )
+                        _exit( 2 );
+                    *pCur++ = Vec_IntSize(vObj);
+                    Vec_IntForEachEntry( vObj, iTemp, k )
+                        *pCur++ = iTemp;
+                }
+                pBuf[0] = 1;
+                _exit( 0 );
+            }
+            nRunning++;
+        }
+        if ( nRunning > 0 )
+        {
+            int Status, Pid = wait( &Status );
+            if ( Pid < 0 )
+                break;
+            for ( g = 0; g < nProcs; g++ )
+                if ( pPids[g] == Pid )
+                {
+                    pPids[g] = 0;
+                    if ( !WIFEXITED(Status) || WEXITSTATUS(Status) != 0 || ppBufs[g][0] != 1 )
+                        nFailed++;
+                    break;
+                }
+            nRunning--;
+        }
+    }
+    if ( !nFailed )
+        for ( g = 0; g < nProcs; g++ )
+        {
+            int * pCur = ppBufs[g] + 1, n;
+            for ( i = pStart[g]; i < pStart[g+1]; i++ )
+            {
+                vObj = Vec_WecEntry( pGia->vMapping2, i );
+                Vec_IntClear( vObj );
+                for ( n = *pCur++; n > 0; n-- )
+                    Vec_IntPush( vObj, *pCur++ );
+            }
+        }
+    for ( g = 0; g < nProcs; g++ )
+        if ( ppBufs[g] )
+            munmap( ppBufs[g], sizeof(int) * nCap );
+    // back to the packed mapping
+    Gia_ManComputeOneWin( pGia, -1, NULL, NULL, NULL, NULL );
+    Vec_IntFreeP( &pGia->vPacking );
+    if ( fVerbose )
+        printf( "&satlut -J %d: %d LUT ranges, %d failed.\n", nProcs, nProcs, nFailed );
+    ABC_FREE( pStart ); ABC_FREE( pPids ); ABC_FREE( ppBufs );
+    return !nFailed;
+}
+#endif
+
+void Gia_ManLutSat( Gia_Man_t * pGia, int LutSize, int nNumber, int nImproves, int nBTLimit, int DelayMax, int nEdges, int fDelay, int fReverse, int fVerbose, int fVeryVerbose, int nProcs )
 {
     int iLut, nImproveCount = 0;
-    Sbl_Man_t * p   = Sbl_ManAlloc( pGia, nNumber );
+    Sbl_Man_t * p;
+#ifndef _WIN32
+    if ( nProcs > 1 && !fDelay && Gia_ManObjNum(pGia) > 10000 && Gia_ManLutSatPar( pGia, LutSize, nNumber, nImproves, nBTLimit, DelayMax, nEdges, fDelay, fReverse, fVerbose, nProcs ) )
+        return;
+#endif
+    p = Sbl_ManAlloc( pGia, nNumber );
     p->LutSize      = LutSize;      // LUT size
     p->nBTLimit     = nBTLimit;     // conflicts
     p->DelayMax     = DelayMax;     // external delay

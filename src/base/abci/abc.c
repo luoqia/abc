@@ -48318,11 +48318,11 @@ usage:
 ***********************************************************************/
 int Abc_CommandAbc9SatLut( Abc_Frame_t * pAbc, int argc, char ** argv )
 {
-    extern void Gia_ManLutSat( Gia_Man_t * p, int LutSize, int nNumber, int nImproves, int nBTLimit, int DelayMax, int nEdges, int fDelay, int fReverse, int fVerbose, int fVeryVerbose );
+    extern void Gia_ManLutSat( Gia_Man_t * p, int LutSize, int nNumber, int nImproves, int nBTLimit, int DelayMax, int nEdges, int fDelay, int fReverse, int fVerbose, int fVeryVerbose, int nProcs );
     int c, LutSize = 0, nNumber = 32, nImproves = 0, nBTLimit = 100, DelayMax = 0, nEdges = 0;
-    int fDelay = 0, fReverse = 0, fVeryVerbose = 0, fVerbose = 0;
+    int fDelay = 0, fReverse = 0, fVeryVerbose = 0, fVerbose = 0, nProcs = 1;
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "NICDQdrwvh" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "NICDQJdrwvh" ) ) != EOF )
     {
         switch ( c )
         {
@@ -48376,6 +48376,17 @@ int Abc_CommandAbc9SatLut( Abc_Frame_t * pAbc, int argc, char ** argv )
             nEdges = atoi(argv[globalUtilOptind]);
             globalUtilOptind++;
             break;
+        case 'J':
+            if ( globalUtilOptind >= argc )
+            {
+                Abc_Print( -1, "Command line switch \"-J\" should be followed by an integer.\n" );
+                goto usage;
+            }
+            nProcs = atoi(argv[globalUtilOptind]);
+            globalUtilOptind++;
+            if ( nProcs < 1 || nProcs > 256 )
+                goto usage;
+            break;
         case 'd':
             fDelay ^= 1;
             break;
@@ -48408,17 +48419,18 @@ int Abc_CommandAbc9SatLut( Abc_Frame_t * pAbc, int argc, char ** argv )
     if ( LutSize > 6 )
         Abc_Print( 0, "Current AIG is mapped into %d-LUTs (only 6-LUT mapping is currently supported).\n", Gia_ManLutSizeMax(pAbc->pGia) );
     else
-        Gia_ManLutSat( pAbc->pGia, LutSize, nNumber, nImproves, nBTLimit, DelayMax, nEdges, fDelay, fReverse, fVerbose, fVeryVerbose );
+        Gia_ManLutSat( pAbc->pGia, LutSize, nNumber, nImproves, nBTLimit, DelayMax, nEdges, fDelay, fReverse, fVerbose, fVeryVerbose, nProcs );
     return 0;
 
 usage:
-    Abc_Print( -2, "usage: &satlut [-NICDQ num] [-drwvh]\n" );
+    Abc_Print( -2, "usage: &satlut [-NICDQJ num] [-drwvh]\n" );
     Abc_Print( -2, "\t           performs SAT-based remapping of the LUT-mapped network\n" );
     Abc_Print( -2, "\t-N num   : the limit on AIG nodes in the window (num <= 128) [default = %d]\n", nNumber );
     Abc_Print( -2, "\t-I num   : the limit on the number of improved windows [default = %d]\n", nImproves );
     Abc_Print( -2, "\t-C num   : the limit on the number of conflicts [default = %d]\n", nBTLimit );
     Abc_Print( -2, "\t-D num   : the user-specified required times at the outputs [default = %d]\n", DelayMax );
     Abc_Print( -2, "\t-Q num   : the maximum number of edges [default = %d]\n", nEdges );
+    Abc_Print( -2, "\t-J num   : the number of parallel processes over node ranges [default = %d]\n", nProcs );
     Abc_Print( -2, "\t-d       : toggles delay optimization [default = %s]\n", fDelay? "yes": "no" );
     Abc_Print( -2, "\t-r       : toggles using reverse search [default = %s]\n", fReverse? "yes": "no" );
     Abc_Print( -2, "\t-v       : toggles verbose output [default = %s]\n", fVerbose? "yes": "no" );
