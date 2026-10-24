@@ -430,10 +430,11 @@ static Aig_Man_t * Gia_ManSynch2ChoicesPar( Gia_Man_t * pMiter, int nSnap, Dch_P
     assert( Gia_ManCoNum(pMiter) % nSnap == 0 );
     nOuts = Gia_ManCoNum(pMiter) / nSnap;
     // Groups overlap in shared logic, which every group re-proves: on CVA6
-    // (406k AND nodes) two groups cost no more work than one, sixteen cost
-    // twice as much. One group per ~200k original nodes keeps the total work
-    // near the serial sweep's; -J only caps the count. NULL: run serially.
-    nGroups = Abc_MinInt( Abc_MinInt( pPars->nProcs, nOuts ), Abc_MaxInt( 1, (Gia_ManAndNum(pMiter) / nSnap + 100000) / 200000 ) );
+    // (406k AND nodes) sixteen groups cost twice the work of one, but the
+    // sweep is the longest serial step of the PIF tail (59 s with two groups,
+    // 26 s with fourteen), so one group per ~25k original nodes trades that
+    // work for wall time; -J caps the count. NULL: run serially.
+    nGroups = Abc_MinInt( Abc_MinInt( pPars->nProcs, nOuts ), Abc_MaxInt( 1, (Gia_ManAndNum(pMiter) / nSnap + 12500) / 25000 ) );
     if ( nGroups < 2 )
         return NULL;
     // global AIG, built exactly as Gia_ManToAigSkip() does, keeping the map
